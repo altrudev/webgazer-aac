@@ -1,5 +1,5 @@
 /**
- * webgazer-aac.js  v1.1.0
+ * webgazer-aac.js  v1.3.0
  * Accessibility-first enhancement layer for WebGazer.js
  *
  * Fork/patch by ALTRU.dev — Code for Humanity
@@ -12,11 +12,34 @@
  *     webgazerAAC.install()
  *     webgazerAAC.setRegression('ensemble')   // or 'polynomial', 'rbf', 'ridge'
  *     webgazerAAC.enableAdaptiveRecalibration()
+ *     webgazerAAC.enableDriftWatchdog()       // optional: auto-detect model staleness
  *
  *   At calibration end, call:
- *     webgazerAAC.fitUserBasis()   // fits per-user PCA from collected patches
+ *     webgazerAAC.fitUserBasis()              // fits per-user PCA from collected patches
+ *     await webgazerAAC.saveCalibration()     // persist to IndexedDB
+ *
+ *   On page load (before webgazer.begin()):
+ *     const loaded = await webgazerAAC.loadCalibration();
+ *     if (loaded) { ... skip calibration UI ... }
+ *
+ *   Dwell gating:
+ *     const timer = webgazerAAC.createDwellTimer({ dwellMs: 800 });
+ *     timer.update(element, gazeX, gazeY, confidence, isSaccade, isBlink);
  *
  *   Everything else (webgazer.begin(), setGazeListener(), etc.) stays identical.
+ *
+ * IMPROVEMENTS IN v1.3.0 OVER v1.2.0:
+ *   9.  Confidence-gated dwell — DwellTimer class; pauses progress when Kalman
+ *                                confidence is below threshold; emits
+ *                                webgazer-aac:dwell-progress / complete / cancel
+ *  10.  IndexedDB persistence  — CalibrationStore class; saves/loads regression
+ *                                datasets, PCA basis, and Kalman params across
+ *                                sessions; graceful fallback in private browsing
+ *
+ * IMPROVEMENTS IN v1.2.0 OVER v1.1.0:
+ *   8. Drift watchdog      — rolling residual tracker; emits 'webgazer-aac:drift-warning'
+ *                            and 'webgazer-aac:drift-critical' CustomEvents when the
+ *                            regression model silently degrades mid-session
  *
  * IMPROVEMENTS IN v1.1.0 OVER v1.0.0:
  *   1. Per-user PCA basis  — fitted from actual calibration patches, replaces
@@ -831,6 +854,446 @@
     get() { return this._last; },
   };
 
+  // ─── Confidence-gated dwell timer ────────────────────────────────────────
+
+  /**
+   * DwellTimer — tracks gaze fixation on DOM elements and fires completion
+   * events only when confidence is high enough to trust the fixation.
+   *
+   * Design:
+   *   • Each call to update() passes the current gaze point, confidence,
+   *     isSaccade, and isBlink flags from the gaze listener output.
+   *   • Progress [0→1] advances at (dt / dwellMs) per frame while the gaze
+   *     is inside the target element's bounding rect AND confidence ≥ minConfidence.
+   *   • Progress freezes (does not reset) when:
+   *       - confidence drops below minConfidence
+   *       - isSaccade is true
+   *       - isBlink is true (gaze listener already passes null during blinks;
+   *         this handles the case where the caller passes isBlink explicitly)
+   *   • Progress resets to 0 when gaze leaves the element's bounding rect.
+   *   • On completion the timer fires 'webgazer-aac:dwell-complete' on the
+   *     target element AND calls webgazerAAC.recordDwellHitXY() automatically
+   *     so the drift watchdog and adaptive recalibrator both receive the signal.
+   *
+   * Events fired on the target element (all bubble):
+   *   webgazer-aac:dwell-progress  — {progress, confidence, x, y}   each frame
+   *   webgazer-aac:dwell-complete  — {x, y}                          on 100%
+   *   webgazer-aac:dwell-cancel    — {reason}                        on leave
+   *
+   * Constructor options:
+   *   dwellMs        {number}  — ms to complete a dwell (default 800)
+   *   minConfidence  {number}  — 0–1 Kalman confidence gate (default 0.25)
+   *   holdAfterMs    {number}  — ms to freeze timer after completion before
+   *                              it can fire again on the same element (default 1200)
+   *   aacRef         {object}  — webgazerAAC reference for recordDwellHitXY
+   *                              (set automatically by webgazerAAC.createDwellTimer)
+   */
+  function DwellTimer(options) {
+    options = options || {};
+    this.dwellMs       = options.dwellMs       || 800;
+    this.minConfidence = options.minConfidence || 0.25;
+    this.holdAfterMs   = options.holdAfterMs   || 1200;
+    this._aacRef       = options.aacRef        || null;
+
+    this._target     = null;   // current DOM element being dwelled on
+    this._progress   = 0;      // 0–1
+    this._lastT      = null;
+    this._holdUntil  = 0;      // timestamp: freeze re-fire after completion
+  }
+
+  DwellTimer.prototype = {
+
+    /**
+     * Call this from your setGazeListener callback every frame.
+     *
+     * @param {Element|null} element     — element under the gaze point (or null)
+     * @param {number}       x           — gaze X from listener
+     * @param {number}       y           — gaze Y from listener
+     * @param {number}       confidence  — from listener result (0–1)
+     * @param {boolean}      isSaccade   — from listener result
+     * @param {boolean}      [isBlink]   — optional; listener already returns null
+     *                                     during blinks, but pass true if you track it
+     * @returns {number} current progress 0–1
+     */
+    update(element, x, y, confidence, isSaccade, isBlink) {
+      const now = performance.now();
+
+      // Null gaze (blink) — freeze progress, don't reset
+      if (element === null || isBlink) {
+        this._lastT = now;
+        return this._progress;
+      }
+
+      // Element changed — cancel previous dwell
+      if (element !== this._target) {
+        if (this._target !== null && this._progress > 0) {
+          this._fireEvent(this._target, 'webgazer-aac:dwell-cancel',
+            { reason: 'gaze-left', x, y });
+        }
+        this._target   = element;
+        this._progress = 0;
+        this._lastT    = now;
+        return 0;
+      }
+
+      const dt = this._lastT !== null ? Math.min(now - this._lastT, 100) : 0;
+      this._lastT = now;
+
+      // Freeze conditions — progress holds, does not advance or reset
+      const frozen = isSaccade ||
+                     confidence < this.minConfidence ||
+                     now < this._holdUntil;
+
+      if (!frozen) {
+        this._progress = Math.min(1, this._progress + dt / this.dwellMs);
+      }
+
+      // Fire progress event
+      this._fireEvent(element, 'webgazer-aac:dwell-progress', {
+        progress:   this._progress,
+        confidence,
+        x, y,
+        frozen,
+      });
+
+      // Completion
+      if (this._progress >= 1 && now >= this._holdUntil) {
+        this._holdUntil = now + this.holdAfterMs;
+        this._progress  = 0;
+        this._fireEvent(element, 'webgazer-aac:dwell-complete', { x, y });
+        // Feed drift watchdog + adaptive recalibrator
+        if (this._aacRef) {
+          try { this._aacRef.recordDwellHitXY(x, y); } catch (e) {}
+        }
+      }
+
+      return this._progress;
+    },
+
+    /** Manually reset progress (e.g. after a re-calibration or page nav). */
+    reset() {
+      this._target    = null;
+      this._progress  = 0;
+      this._lastT     = null;
+      this._holdUntil = 0;
+    },
+
+    /** Current progress 0–1. */
+    get progress() { return this._progress; },
+
+    _fireEvent(target, name, detail) {
+      try {
+        if (typeof CustomEvent !== 'undefined') {
+          target.dispatchEvent(new CustomEvent(name, { detail, bubbles: true }));
+        }
+      } catch (e) {}
+    },
+  };
+
+  // ─── Drift watchdog ───────────────────────────────────────────────────────
+
+  /**
+   * DriftWatchdog — detects when the regression model has silently gone stale.
+   *
+   * Strategy:
+   *   Every time a ground-truth gaze position is confirmed (calibration click,
+   *   dwell hit, or explicit recordScreenPosition call) we compare it against
+   *   the current regression prediction and record the Euclidean residual.
+   *
+   *   Residuals are tracked in a circular buffer and summarised as an
+   *   exponential-decay-weighted RMSE so that recent errors dominate.
+   *
+   *   Two thresholds govern the output:
+   *     warnThreshold   — RMSE above this fires 'webgazer-aac:drift-warning'
+   *     critThreshold   — RMSE above this fires 'webgazer-aac:drift-critical'
+   *
+   *   Between threshold crossings the watchdog is hysteretic: it won't emit
+   *   another event of the same level until the RMSE first falls back below
+   *   80% of the threshold, preventing event storms on jittery sessions.
+   *
+   *   All events carry a detail object:
+   *     { rmse, level, sampleCount, timestamp }
+   *
+   * Constructor options (all optional):
+   *   windowSize    {number} — max residuals to hold in the buffer (default 40)
+   *   decayAlpha    {number} — EMA weight per new sample, 0–1 (default 0.12)
+   *   minSamples    {number} — min samples before RMSE is considered valid (default 8)
+   *   warnThreshold {number} — RMSE px for warning level (default 120)
+   *   critThreshold {number} — RMSE px for critical level (default 220)
+   *   onWarn        {fn}     — optional callback in addition to CustomEvent
+   *   onCritical    {fn}     — optional callback in addition to CustomEvent
+   */
+  function DriftWatchdog(regression, options) {
+    options = options || {};
+    this.regression    = regression;
+    this.windowSize    = options.windowSize    || 40;
+    this.decayAlpha    = options.decayAlpha    || 0.12;
+    this.minSamples    = options.minSamples    || 8;
+    this.warnThreshold = options.warnThreshold || 120;
+    this.critThreshold = options.critThreshold || 220;
+    this.onWarn        = options.onWarn        || null;
+    this.onCritical    = options.onCritical    || null;
+
+    this._enabled      = false;
+    this._buffer       = [];          // raw residuals (circular)
+    this._weightedSS   = 0;           // weighted sum-of-squares
+    this._weightSum    = 0;           // weight accumulator
+    this._rmse         = 0;
+    this._sampleCount  = 0;
+    this._lastLevel    = 'ok';        // 'ok' | 'warning' | 'critical'
+    // Hysteresis: don't re-fire until RMSE drops below this fraction of threshold
+    this._hysteresis   = 0.8;
+  }
+
+  DriftWatchdog.prototype = {
+
+    enable()  { this._enabled = true;  return this; },
+    disable() { this._enabled = false; return this; },
+
+    /** Current weighted RMSE in pixels. 0 if insufficient samples. */
+    get rmse() { return this._rmse; },
+
+    /** Number of ground-truth samples recorded so far. */
+    get sampleCount() { return this._sampleCount; },
+
+    /**
+     * Record a ground-truth gaze position and compute residual.
+     * Called by the install() intercepts — you normally don't call this directly.
+     *
+     * @param {object} eyePatches  — raw patches from WebGazer
+     * @param {number} trueX       — confirmed screen X
+     * @param {number} trueY       — confirmed screen Y
+     */
+    record(eyePatches, trueX, trueY) {
+      if (!this._enabled || !this.regression) return;
+
+      let pred = null;
+      try { pred = this.regression.predict(eyePatches); } catch (e) {}
+      if (!pred) return; // not enough calibration data yet
+
+      const residual = Math.sqrt((pred.x - trueX) ** 2 + (pred.y - trueY) ** 2);
+      this._sampleCount++;
+
+      // Circular buffer — keep raw residuals for potential future use
+      this._buffer.push(residual);
+      if (this._buffer.length > this.windowSize) this._buffer.shift();
+
+      // Exponential-decay weighted RMSE
+      // Each new sample gets weight 1; existing accumulated weight decays by (1 - alpha)
+      this._weightedSS  = this._weightedSS  * (1 - this.decayAlpha) + residual * residual * this.decayAlpha;
+      this._weightSum   = this._weightSum   * (1 - this.decayAlpha) + this.decayAlpha;
+      this._rmse        = this._sampleCount >= this.minSamples
+        ? Math.sqrt(this._weightedSS / (this._weightSum || 1))
+        : 0;
+
+      if (this._rmse === 0) return;
+
+      // Level determination with hysteresis
+      const prevLevel = this._lastLevel;
+      let newLevel;
+
+      if (this._rmse >= this.critThreshold) {
+        newLevel = 'critical';
+      } else if (this._rmse >= this.warnThreshold) {
+        newLevel = 'warning';
+      } else {
+        newLevel = 'ok';
+      }
+
+      // Hysteresis: suppress upgrade if we haven't cooled down yet
+      if (newLevel !== 'ok' && newLevel === prevLevel) return; // same non-ok level, no re-fire
+
+      // Downgrade hysteresis: only clear a level once RMSE drops well below threshold
+      if (newLevel === 'ok' && prevLevel === 'critical' &&
+          this._rmse > this.critThreshold * this._hysteresis) return;
+      if (newLevel !== 'critical' && prevLevel === 'critical' &&
+          this._rmse > this.critThreshold * this._hysteresis) return;
+      if (newLevel === 'ok' && prevLevel === 'warning' &&
+          this._rmse > this.warnThreshold * this._hysteresis) return;
+
+      this._lastLevel = newLevel;
+      if (newLevel === 'ok') return; // cooled down, no event needed
+
+      this._emit(newLevel);
+    },
+
+    _emit(level) {
+      const detail = {
+        rmse:        Math.round(this._rmse),
+        level,
+        sampleCount: this._sampleCount,
+        timestamp:   Date.now(),
+      };
+      const eventName = level === 'critical'
+        ? 'webgazer-aac:drift-critical'
+        : 'webgazer-aac:drift-warning';
+      try {
+        if (typeof CustomEvent !== 'undefined' && typeof document !== 'undefined') {
+          document.dispatchEvent(new CustomEvent(eventName, { detail, bubbles: true }));
+        }
+      } catch (e) {}
+      if (level === 'critical' && typeof this.onCritical === 'function') {
+        try { this.onCritical(detail); } catch (e) {}
+      }
+      if (level === 'warning' && typeof this.onWarn === 'function') {
+        try { this.onWarn(detail); } catch (e) {}
+      }
+      console.warn('[webgazer-aac] drift-' + level + ': RMSE=' + detail.rmse + 'px ' +
+        '(n=' + detail.sampleCount + ')');
+    },
+
+    /** Reset all accumulated state (e.g. after a re-calibration). */
+    reset() {
+      this._buffer      = [];
+      this._weightedSS  = 0;
+      this._weightSum   = 0;
+      this._rmse        = 0;
+      this._sampleCount = 0;
+      this._lastLevel   = 'ok';
+    },
+  };
+
+  // ─── IndexedDB calibration persistence ───────────────────────────────────
+
+  /**
+   * CalibrationStore — saves and restores full calibration state to IndexedDB.
+   *
+   * What is persisted:
+   *   • Polynomial regression dataset   (features + screen positions + weights)
+   *   • RBF regression dataset          (same)
+   *   • PCA basis vectors + mean        (left + right eye)
+   *   • Kalman noise params             (Q, R)
+   *   • Metadata                        (version, timestamp, screenSize)
+   *
+   * API (all async, return Promises):
+   *   store.save(snapshot)   — persist a CalibrationSnapshot object
+   *   store.load()           — resolve with snapshot or null if none / incompatible
+   *   store.clear()          — delete stored calibration
+   *   store.available()      — resolve with boolean (false in private browsing)
+   *
+   * The store is keyed by `profileKey` so multiple users / devices can
+   * coexist in the same browser origin.
+   *
+   * Constructor options:
+   *   dbName     {string}  — IDB database name (default 'webgazer-aac')
+   *   storeName  {string}  — IDB object store name (default 'calibrations')
+   *   profileKey {string}  — record key within the store (default 'default')
+   *   backend    {object}  — optional mock backend for testing (see _MemoryBackend)
+   */
+  function CalibrationStore(options) {
+    options = options || {};
+    this.dbName     = options.dbName     || 'webgazer-aac';
+    this.storeName  = options.storeName  || 'calibrations';
+    this.profileKey = options.profileKey || 'default';
+    this._backend   = options.backend    || null; // null → use real IDB
+    this._db        = null; // cached IDB connection
+  }
+
+  CalibrationStore.prototype = {
+
+    /** Resolve with true if IDB is accessible. */
+    available() {
+      if (this._backend) return Promise.resolve(true);
+      return new Promise(resolve => {
+        if (typeof indexedDB === 'undefined') { resolve(false); return; }
+        try {
+          const req = indexedDB.open('__webgazer_aac_probe__', 1);
+          req.onsuccess  = e => { e.target.result.close(); resolve(true); };
+          req.onerror    = ()  => resolve(false);
+          req.onblocked  = ()  => resolve(false);
+        } catch (e) { resolve(false); }
+      });
+    },
+
+    /**
+     * Persist calibration state.
+     * @param {object} snapshot — produced by webgazerAAC.getCalibrationSnapshot()
+     * @returns {Promise<boolean>} true on success
+     */
+    save(snapshot) {
+      if (this._backend) return this._backend.save(this.profileKey, snapshot);
+      return this._openDB().then(db => new Promise((resolve, reject) => {
+        try {
+          const tx  = db.transaction(this.storeName, 'readwrite');
+          const req = tx.objectStore(this.storeName).put(snapshot, this.profileKey);
+          req.onsuccess = () => resolve(true);
+          req.onerror   = e  => reject(e.target.error);
+        } catch (e) { reject(e); }
+      }));
+    },
+
+    /**
+     * Load persisted calibration state.
+     * @returns {Promise<object|null>} snapshot or null if not found / version mismatch
+     */
+    load() {
+      const checkVersion = result => {
+        if (!result || result.aacVersion !== '1.3.0') return null;
+        // Screen size mismatch warning — caller decides whether to use
+        if (result.screenWidth  !== (typeof window !== 'undefined' ? window.innerWidth  : 0) ||
+            result.screenHeight !== (typeof window !== 'undefined' ? window.innerHeight : 0)) {
+          result._screenMismatch = true;
+        }
+        return result;
+      };
+
+      if (this._backend) {
+        return this._backend.load(this.profileKey).then(checkVersion);
+      }
+      return this._openDB().then(db => new Promise((resolve, reject) => {
+        try {
+          const tx  = db.transaction(this.storeName, 'readonly');
+          const req = tx.objectStore(this.storeName).get(this.profileKey);
+          req.onsuccess = e => resolve(checkVersion(e.target.result));
+          req.onerror   = e => reject(e.target.error);
+        } catch (e) { reject(e); }
+      }));
+    },
+
+    /** Delete stored calibration for this profile. */
+    clear() {
+      if (this._backend) return this._backend.clear(this.profileKey);
+      return this._openDB().then(db => new Promise((resolve, reject) => {
+        try {
+          const tx  = db.transaction(this.storeName, 'readwrite');
+          const req = tx.objectStore(this.storeName).delete(this.profileKey);
+          req.onsuccess = () => resolve(true);
+          req.onerror   = e  => reject(e.target.error);
+        } catch (e) { reject(e); }
+      }));
+    },
+
+    _openDB() {
+      if (this._db) return Promise.resolve(this._db);
+      const self = this;
+      return new Promise((resolve, reject) => {
+        if (typeof indexedDB === 'undefined') { reject(new Error('IDB unavailable')); return; }
+        try {
+          const req = indexedDB.open(self.dbName, 1);
+          req.onupgradeneeded = e => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains(self.storeName)) {
+              db.createObjectStore(self.storeName);
+            }
+          };
+          req.onsuccess = e => { self._db = e.target.result; resolve(self._db); };
+          req.onerror   = e => reject(e.target.error);
+        } catch (e) { reject(e); }
+      });
+    },
+  };
+
+  /**
+   * In-memory IDB backend for testing — no real IDB needed.
+   * Pass as `backend` option to CalibrationStore constructor.
+   */
+  function _MemoryBackend() { this._store = {}; }
+  _MemoryBackend.prototype = {
+    save(key, value) { this._store[key] = JSON.parse(JSON.stringify(value)); return Promise.resolve(true); },
+    load(key)        { const v = this._store[key]; return Promise.resolve(v ? JSON.parse(JSON.stringify(v)) : null); },
+    clear(key)       { delete this._store[key]; return Promise.resolve(true); },
+  };
+
   // ─── Adaptive recalibration ───────────────────────────────────────────────
 
   function AdaptiveRecalibrator(regressionModule) {
@@ -865,6 +1328,8 @@
     _saccade:        new SaccadeDetector(),
     _cache:          new FrameCache(),
     _recalibrator:   null,
+    _watchdog:       null,
+    _store:          null,
     _currentMode:    'ensemble',
     _installed:      false,
     _lastPatches:    null,
@@ -959,13 +1424,17 @@
             // Track ensemble error
             if (self._regression instanceof EnsembleRegression)
               self._regression.trackError(self._lastPatches, x, y);
+            // Drift watchdog — record residual against ground truth
+            if (self._watchdog) self._watchdog.record(self._lastPatches, x, y);
           } catch (e) {}
         }
       };
 
       this._recalibrator = new AdaptiveRecalibrator(this._regressions.ensemble);
+      this._watchdog     = new DriftWatchdog(this._regressions.ensemble);
+      this._store        = new CalibrationStore();
       this._installed    = true;
-      console.info('[webgazer-aac] v1.1.0 installed — regression: ' + this._currentMode);
+      console.info('[webgazer-aac] v1.3.0 installed — regression: ' + this._currentMode);
       return this;
     },
 
@@ -1010,14 +1479,231 @@
     enableAdaptiveRecalibration()  { if (this._recalibrator) this._recalibrator.enable();  return this; },
     disableAdaptiveRecalibration() { if (this._recalibrator) this._recalibrator.disable(); return this; },
 
+    /**
+     * Enable the drift watchdog.
+     * Optionally pass options to override defaults (warnThreshold, critThreshold,
+     * windowSize, decayAlpha, minSamples, onWarn, onCritical).
+     * Listen for events on document:
+     *   document.addEventListener('webgazer-aac:drift-warning',  e => ...)
+     *   document.addEventListener('webgazer-aac:drift-critical', e => ...)
+     */
+    enableDriftWatchdog(options) {
+      if (!this._watchdog) {
+        // install() not yet called — create with current regression (null OK, updated later)
+        this._watchdog = new DriftWatchdog(this._regression, options);
+      } else if (options) {
+        // Merge new options into existing watchdog
+        if (options.warnThreshold != null)  this._watchdog.warnThreshold = options.warnThreshold;
+        if (options.critThreshold != null)  this._watchdog.critThreshold = options.critThreshold;
+        if (options.windowSize    != null)  this._watchdog.windowSize    = options.windowSize;
+        if (options.decayAlpha    != null)  this._watchdog.decayAlpha    = options.decayAlpha;
+        if (options.minSamples    != null)  this._watchdog.minSamples    = options.minSamples;
+        if (options.onWarn        != null)  this._watchdog.onWarn        = options.onWarn;
+        if (options.onCritical    != null)  this._watchdog.onCritical    = options.onCritical;
+      }
+      this._watchdog.enable();
+      return this;
+    },
+
+    disableDriftWatchdog() {
+      if (this._watchdog) this._watchdog.disable();
+      return this;
+    },
+
+    /** Reset drift watchdog state (call after re-calibration). */
+    resetDriftWatchdog() {
+      if (this._watchdog) this._watchdog.reset();
+      return this;
+    },
+
+    /** Current drift RMSE in pixels (0 if watchdog disabled or insufficient data). */
+    getDriftRmse() {
+      return this._watchdog ? this._watchdog.rmse : 0;
+    },
+
+    // ── Confidence-gated dwell ──────────────────────────────────────────────
+
+    /**
+     * Create a DwellTimer wired to this webgazerAAC instance.
+     * The returned timer's update() will automatically call recordDwellHitXY()
+     * on completion, feeding the drift watchdog and adaptive recalibrator.
+     *
+     * @param {object} options — { dwellMs, minConfidence, holdAfterMs }
+     * @returns {DwellTimer}
+     *
+     * Example usage inside setGazeListener:
+     *   webgazer.setGazeListener((data) => {
+     *     if (!data) return;
+     *     const el = document.elementFromPoint(data.x, data.y);
+     *     timer.update(el, data.x, data.y, data.confidence, data.isSaccade);
+     *   });
+     */
+    createDwellTimer(options) {
+      options = Object.assign({}, options || {}, { aacRef: this });
+      return new DwellTimer(options);
+    },
+
+    // ── IndexedDB calibration persistence ──────────────────────────────────
+
+    /**
+     * Configure the CalibrationStore (optional — defaults are sensible).
+     * Call before install() if you need a custom dbName, storeName, or profileKey.
+     * @param {object} options — { dbName, storeName, profileKey }
+     */
+    configureStore(options) {
+      this._store = new CalibrationStore(options || {});
+      return this;
+    },
+
+    /**
+     * Build a serialisable snapshot of all calibration state.
+     * @returns {object} snapshot ready for CalibrationStore.save()
+     */
+    getCalibrationSnapshot() {
+      const snap = {
+        aacVersion:   '1.3.0',
+        timestamp:    Date.now(),
+        screenWidth:  typeof window !== 'undefined' ? window.innerWidth  : 0,
+        screenHeight: typeof window !== 'undefined' ? window.innerHeight : 0,
+        kalman: { Q: this._kalman.Q, R: this._kalman.R },
+        regressions:  {},
+        pca: {
+          left:  LEFT_PCA.fitted  ? { mean: Array.from(LEFT_PCA.mean),  basis: LEFT_PCA.basis,  fitted: true  } : { fitted: false },
+          right: RIGHT_PCA.fitted ? { mean: Array.from(RIGHT_PCA.mean), basis: RIGHT_PCA.basis, fitted: true  } : { fitted: false },
+        },
+      };
+      // Collect data from all named regressions (avoid double-saving shared refs)
+      const saved = new Set();
+      for (const [name, reg] of Object.entries(this._regressions || {})) {
+        // EnsembleRegression delegates to poly/rbf — save those by their own name
+        if (reg instanceof EnsembleRegression) continue;
+        if (saved.has(reg)) continue;
+        saved.add(reg);
+        snap.regressions[name] = reg.getData();
+      }
+      return snap;
+    },
+
+    /**
+     * Restore calibration from a snapshot object.
+     * Called automatically by loadCalibration(); you can also call it manually.
+     * @param {object} snapshot
+     */
+    applyCalibrationSnapshot(snapshot) {
+      if (!snapshot || snapshot.aacVersion !== '1.3.0') return false;
+
+      // Kalman params
+      if (snapshot.kalman) {
+        if (snapshot.kalman.Q != null) this._kalman.Q = snapshot.kalman.Q;
+        if (snapshot.kalman.R != null) this._kalman.R = snapshot.kalman.R;
+      }
+
+      // PCA bases
+      if (snapshot.pca) {
+        if (snapshot.pca.left && snapshot.pca.left.fitted) {
+          LEFT_PCA.mean   = new Float64Array(snapshot.pca.left.mean);
+          LEFT_PCA.basis  = snapshot.pca.left.basis;
+          LEFT_PCA.fitted = true;
+        }
+        if (snapshot.pca.right && snapshot.pca.right.fitted) {
+          RIGHT_PCA.mean   = new Float64Array(snapshot.pca.right.mean);
+          RIGHT_PCA.basis  = snapshot.pca.right.basis;
+          RIGHT_PCA.fitted = true;
+        }
+      }
+
+      // Regression datasets
+      if (snapshot.regressions && this._regressions) {
+        for (const [name, data] of Object.entries(snapshot.regressions)) {
+          const reg = this._regressions[name];
+          if (reg && typeof reg.setData === 'function') reg.setData(data);
+        }
+        // Mark everything dirty so models re-fit on next predict()
+        for (const reg of Object.values(this._regressions)) {
+          if (reg && reg._dirty !== undefined) reg._dirty = true;
+          if (reg instanceof EnsembleRegression) {
+            if (reg.poly) reg.poly._dirty = true;
+            if (reg.rbf)  reg.rbf._dirty  = true;
+          }
+        }
+      }
+
+      console.info('[webgazer-aac] calibration snapshot applied' +
+        (snapshot._screenMismatch ? ' (⚠ screen size mismatch)' : ''));
+      return true;
+    },
+
+    /**
+     * Save current calibration to IndexedDB.
+     * @param {object} [storeOptions] — optional { profileKey, dbName, ... }
+     * @returns {Promise<boolean>}
+     */
+    saveCalibration(storeOptions) {
+      if (storeOptions) this.configureStore(storeOptions);
+      if (!this._store) this._store = new CalibrationStore();
+      const snap = this.getCalibrationSnapshot();
+      return this._store.save(snap).catch(e => {
+        console.warn('[webgazer-aac] saveCalibration failed:', e);
+        return false;
+      });
+    },
+
+    /**
+     * Load calibration from IndexedDB and apply it.
+     * Returns the snapshot (with _screenMismatch flag if applicable) or null.
+     * @param {object} [storeOptions]
+     * @returns {Promise<object|null>}
+     */
+    loadCalibration(storeOptions) {
+      if (storeOptions) this.configureStore(storeOptions);
+      if (!this._store) this._store = new CalibrationStore();
+      return this._store.load().then(snap => {
+        if (!snap) return null;
+        this.applyCalibrationSnapshot(snap);
+        return snap;
+      }).catch(e => {
+        console.warn('[webgazer-aac] loadCalibration failed:', e);
+        return null;
+      });
+    },
+
+    /**
+     * Clear stored calibration from IndexedDB.
+     * @returns {Promise<boolean>}
+     */
+    clearCalibration() {
+      if (!this._store) this._store = new CalibrationStore();
+      return this._store.clear().catch(e => {
+        console.warn('[webgazer-aac] clearCalibration failed:', e);
+        return false;
+      });
+    },
+
+    /** Check whether IndexedDB is available in the current context. */
+    isStorageAvailable() {
+      if (!this._store) this._store = new CalibrationStore();
+      return this._store.available();
+    },
+
     recordDwellHit(element) {
       if (!this._recalibrator || !this._lastPatches) return;
       this._recalibrator.recordElementHit(element, this._lastPatches);
+      // Drift watchdog uses dwell hits as ground-truth signal too
+      if (this._watchdog && element) {
+        try {
+          const r = element.getBoundingClientRect();
+          this._watchdog.record(this._lastPatches, r.left + r.width / 2, r.top + r.height / 2);
+        } catch (e) {}
+      }
     },
 
     recordDwellHitXY(x, y) {
       if (!this._recalibrator || !this._lastPatches) return;
       this._recalibrator.recordHit(x, y, this._lastPatches);
+      // Drift watchdog
+      if (this._watchdog) {
+        try { this._watchdog.record(this._lastPatches, x, y); } catch (e) {}
+      }
     },
 
     /**
@@ -1051,8 +1737,12 @@
     FrameCache,
     AdaptiveRecalibrator,
     PCABasis,
+    DriftWatchdog,
+    DwellTimer,
+    CalibrationStore,
+    _MemoryBackend,
 
-    version: '1.1.0',
+    version: '1.3.0',
   };
 
   global.webgazerAAC = webgazerAAC;

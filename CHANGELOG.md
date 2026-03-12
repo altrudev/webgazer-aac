@@ -1,5 +1,145 @@
 # Changelog
 
+## [1.3.0] — 2026-03-12
+
+### Added
+
+**Confidence-gated dwell timer** (`DwellTimer` class)
+- Tracks gaze fixation on DOM elements; progress advances only when Kalman confidence meets the threshold
+- Progress **freezes** (does not reset) during low confidence, blinks, and saccades — resumes when gaze stabilises
+- Progress resets to 0 only when gaze leaves the element entirely
+- Fires `webgazer-aac:dwell-progress`, `webgazer-aac:dwell-complete`, and `webgazer-aac:dwell-cancel` CustomEvents on the target element
+- On completion, automatically calls `recordDwellHitXY()` so the drift watchdog and adaptive recalibrator both receive the signal
+- Configurable: `dwellMs`, `minConfidence`, `holdAfterMs`
+- Create via `webgazerAAC.createDwellTimer(options)` — wired to the instance automatically
+
+**IndexedDB calibration persistence** (`CalibrationStore` class)
+- Saves and restores full calibration state across sessions: regression datasets, fitted PCA bases, Kalman noise params, screen dimensions
+- Async API: `saveCalibration()`, `loadCalibration()`, `clearCalibration()`, `isStorageAvailable()`
+- Version-checked on load — stale snapshots (wrong `aacVersion`) return `null` rather than silently corrupting state
+- Screen-size mismatch surfaced as `_screenMismatch: true` on the snapshot; caller decides whether to trust a cross-resolution calibration
+- Graceful fallback in private browsing (IDB unavailable) — `save` returns `false`, `load` returns `null`
+- `_MemoryBackend` class exposed for zero-IDB unit testing
+- Multi-profile support via `profileKey` option
+
+### API additions
+
+```js
+// Dwell timer
+const timer = webgazerAAC.createDwellTimer({ dwellMs, minConfidence, holdAfterMs });
+timer.update(element, x, y, confidence, isSaccade, isBlink?)  // → progress 0–1
+timer.reset()
+
+// Calibration persistence
+await webgazerAAC.saveCalibration(options?)
+await webgazerAAC.loadCalibration(options?)
+await webgazerAAC.clearCalibration(options?)
+await webgazerAAC.isStorageAvailable()
+webgazerAAC.getCalibrationSnapshot()          // → serialisable plain object
+webgazerAAC.applyCalibrationSnapshot(snap)    // → boolean
+webgazerAAC.configureStore({ dbName, storeName, profileKey })
+```
+
+Events fired on the dwell target element:
+```js
+'webgazer-aac:dwell-progress'   // { progress, confidence, x, y, frozen }
+'webgazer-aac:dwell-complete'   // { x, y }
+'webgazer-aac:dwell-cancel'     // { reason, x, y }
+```
+
+### Upgrade from v1.2.0
+
+```html
+<!-- Was -->
+<script src="webgazer-aac.js"></script>
+<script>
+  webgazerAAC.install().enableAdaptiveRecalibration().enableDriftWatchdog();
+</script>
+
+<!-- Now — add persistence and dwell timer -->
+<script src="webgazer-aac.js"></script>
+<script>
+  webgazerAAC.install().enableAdaptiveRecalibration().enableDriftWatchdog();
+
+  // Restore previous calibration on load
+  webgazerAAC.loadCalibration().then(saved => {
+    if (!saved) {
+      // run calibration UI, then:
+      webgazerAAC.fitUserBasis();
+      webgazerAAC.saveCalibration();
+    }
+    webgazer.begin();
+  });
+
+  // Replace manual dwell logic with:
+  const timer = webgazerAAC.createDwellTimer({ dwellMs: 800 });
+  webgazer.setGazeListener((data) => {
+    if (!data) return;
+    const el = document.elementFromPoint(data.x, data.y);
+    timer.update(el, data.x, data.y, data.confidence, data.isSaccade);
+  });
+</script>
+```
+
+Everything else is backwards-compatible.
+
+---
+
+## [1.2.0] — 2026-03-12
+
+### Added
+
+**Drift watchdog** (`DriftWatchdog` class)
+- Detects when the regression model silently degrades mid-session using an independent ground-truth residual signal
+- Every confirmed gaze position (calibration click, dwell hit, `recordScreenPosition`) is compared against the current prediction; residuals are tracked as an exponential-decay-weighted RMSE
+- Two configurable thresholds: `warnThreshold` (default 120px) and `critThreshold` (default 220px)
+- Hysteretic: won't re-fire the same level until RMSE cools below 80% of the threshold — prevents event storms
+- `minSamples` gate (default 8) prevents false alerts during model warm-up
+- Fires `webgazer-aac:drift-warning` and `webgazer-aac:drift-critical` CustomEvents on `document`
+- Optional `onWarn` / `onCritical` callbacks in addition to CustomEvents
+- Distinct from ensemble error tracking (`_errPoly`/`_errRbf`), which only compares models against each other — the watchdog uses independent ground-truth and catches both models drifting together
+
+### API additions
+
+```js
+webgazerAAC.enableDriftWatchdog(options?)   // { warnThreshold, critThreshold, minSamples, onWarn, onCritical }
+webgazerAAC.disableDriftWatchdog()
+webgazerAAC.resetDriftWatchdog()            // call after re-calibration
+webgazerAAC.getDriftRmse()                  // → current weighted RMSE in px
+```
+
+Events fired on `document`:
+```js
+'webgazer-aac:drift-warning'    // { rmse, level, sampleCount, timestamp }
+'webgazer-aac:drift-critical'   // { rmse, level, sampleCount, timestamp }
+```
+
+### Wiring
+
+`recordScreenPosition` and `recordDwellHitXY` both now feed the drift watchdog automatically when it is enabled. No changes required in application code.
+
+### Upgrade from v1.1.0
+
+```html
+<!-- Was -->
+<script src="webgazer-aac.js"></script>
+<script>webgazerAAC.install().enableAdaptiveRecalibration();</script>
+
+<!-- Now — optionally add drift watchdog -->
+<script src="webgazer-aac.js"></script>
+<script>
+  webgazerAAC.install().enableAdaptiveRecalibration().enableDriftWatchdog();
+
+  document.addEventListener('webgazer-aac:drift-warning', e => {
+    console.warn('Gaze drift detected — RMSE:', e.detail.rmse, 'px');
+  });
+</script>
+```
+
+Everything else is backwards-compatible.
+
+---
+
 ## [1.1.0] — 2026-03-12
 
 ### Added
