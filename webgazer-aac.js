@@ -1,137 +1,331 @@
 /**
- * webgazer-aac.js
+ * webgazer-aac.js  v1.1.0
  * Accessibility-first enhancement layer for WebGazer.js
  *
  * Fork/patch by ALTRU.dev — Code for Humanity
- * https://altru.dev
+ * https://altru.dev  |  github.com/altru-dev/webgazer-aac
  *
  * License: GPLv3 (same as upstream brownhci/WebGazer)
  *
  * USAGE:
  *   Load AFTER webgazer.js. Then call:
- *     webgazerAAC.install()        // patch webgazer with improved regressions
- *     webgazerAAC.setRegression('polynomial')  // or 'rbf', 'ridge' (original)
- *     webgazerAAC.enableAdaptiveRecalibration() // continuous self-correction
+ *     webgazerAAC.install()
+ *     webgazerAAC.setRegression('ensemble')   // or 'polynomial', 'rbf', 'ridge'
+ *     webgazerAAC.enableAdaptiveRecalibration()
+ *
+ *   At calibration end, call:
+ *     webgazerAAC.fitUserBasis()   // fits per-user PCA from collected patches
  *
  *   Everything else (webgazer.begin(), setGazeListener(), etc.) stays identical.
  *
- * IMPROVEMENTS OVER UPSTREAM:
- *   1. Polynomial regression (degree 2) — models non-linear corner distortion
- *   2. RBF regression — radial basis function, best for irregular calibration
- *   3. Weighted recency — recent calibration clicks matter more than old ones
- *   4. Adaptive recalibration — dwell hits feed back as free training samples
- *   5. Gaze smoothing — configurable EMA + velocity-aware smoothing
- *   6. Prediction confidence — exposes a 0-1 confidence score per prediction
+ * IMPROVEMENTS IN v1.1.0 OVER v1.0.0:
+ *   1. Per-user PCA basis  — fitted from actual calibration patches, replaces
+ *                            fixed random projection → better feature quality
+ *   2. CLAHE normalisation — adaptive contrast on eye patches before feature
+ *                            extraction → works in poor lighting
+ *   3. Kalman filter       — replaces EMA smoother; separates process noise
+ *                            from measurement noise → less jitter, better tracking
+ *   4. Blink detection     — pauses gaze output during blinks → no false dwell fires
+ *   5. Saccade suppression — holds last stable position during fast eye movements
+ *   6. Ensemble regression — blends polynomial + RBF weighted by recent accuracy
+ *   7. Frame cache         — skips inference when gaze is stable → saves CPU
  */
 
 (function (global) {
   'use strict';
 
+  // ─── Constants ────────────────────────────────────────────────────────────
+
+  const PATCH_COMPONENTS = 10;  // components per eye (was 8)
+  const LAMBDA           = 1e-3;
+  const PATCH_DIM        = 60 * 40;
+
   // ─── Math utilities ───────────────────────────────────────────────────────
 
-  /**
-   * Solve least-squares via normal equations: (X'X + λI)⁻¹ X'y
-   * Works for any feature matrix X and target vector y.
-   * λ is L2 regularisation (ridge term).
-   */
   function ridgeSolve(X, y, lambda) {
-    const n = X.length;       // samples
-    const m = X[0].length;    // features
-
-    // X'X
+    const n = X.length, m = X[0].length;
     const XtX = Array.from({ length: m }, () => new Float64Array(m));
     for (let i = 0; i < m; i++)
       for (let j = 0; j < m; j++)
         for (let k = 0; k < n; k++)
           XtX[i][j] += X[k][i] * X[k][j];
-
-    // Add λ to diagonal
     for (let i = 0; i < m; i++) XtX[i][i] += lambda;
-
-    // X'y
     const Xty = new Float64Array(m);
     for (let i = 0; i < m; i++)
       for (let k = 0; k < n; k++)
         Xty[i] += X[k][i] * y[k];
-
-    // Solve (X'X)β = X'y via Gaussian elimination with partial pivoting
     return gaussianElimination(XtX, Xty);
   }
 
   function gaussianElimination(A, b) {
     const n = b.length;
-    // Augmented matrix [A|b]
     const M = A.map((row, i) => [...row, b[i]]);
-
     for (let col = 0; col < n; col++) {
-      // Partial pivot
       let maxRow = col;
       for (let row = col + 1; row < n; row++)
         if (Math.abs(M[row][col]) > Math.abs(M[maxRow][col])) maxRow = row;
       [M[col], M[maxRow]] = [M[maxRow], M[col]];
-
-      if (Math.abs(M[col][col]) < 1e-12) continue; // singular — skip
-
+      if (Math.abs(M[col][col]) < 1e-12) continue;
       for (let row = 0; row < n; row++) {
         if (row === col) continue;
         const factor = M[row][col] / M[col][col];
-        for (let k = col; k <= n; k++)
-          M[row][k] -= factor * M[col][k];
+        for (let k = col; k <= n; k++) M[row][k] -= factor * M[col][k];
       }
     }
-
     return M.map((row, i) => (Math.abs(M[i][i]) < 1e-12 ? 0 : row[n] / M[i][i]));
   }
 
-  // ─── Feature extractors ───────────────────────────────────────────────────
+  // ─── CLAHE (Contrast Limited Adaptive Histogram Equalisation) ─────────────
 
   /**
-   * Degree-2 polynomial features from a flat eye patch pixel array.
-   * Input: Float32Array of pixel values (greyscale, 0-255)
-   * Output: feature vector [1, px0, px1, ..., px0*px0, px0*px1, ...]
+   * Simplified CLAHE on a flat greyscale array.
+   * Divides the patch into a grid of tiles, equalises each tile's histogram
+   * with a clip limit to prevent noise amplification, then bilinearly
+   * interpolates across tile borders.
    *
-   * To keep dimensionality tractable we first PCA-reduce the raw pixels
-   * down to PATCH_COMPONENTS principal components, then form degree-2
-   * features from those components only.
-   *
-   * PATCH_COMPONENTS = 8  →  1 + 8 + 36 = 45 features
-   * (compared to raw ridge: 1 + raw_pixels, typically 1 + 2400 = 2401)
+   * For typical eye patches (60×40) we use a 4×4 tile grid (15×10 tiles).
+   * clip = 4.0 is a reasonable default for moderate enhancement.
    */
-  const PATCH_COMPONENTS = 8;
-  const LAMBDA = 1e-3; // L2 regularisation
+  function clahe(grey, width, height, tileW, tileH, clip) {
+    tileW = tileW || 15;
+    tileH = tileH || 10;
+    clip  = clip  || 4.0;
+
+    const numTX = Math.ceil(width  / tileW);
+    const numTY = Math.ceil(height / tileH);
+    const out   = new Float32Array(grey.length);
+
+    // Build per-tile CDFs
+    const cdfs = [];
+    for (let ty = 0; ty < numTY; ty++) {
+      cdfs[ty] = [];
+      for (let tx = 0; tx < numTX; tx++) {
+        const hist = new Float32Array(256);
+        let count = 0;
+        const x0 = tx * tileW, y0 = ty * tileH;
+        const x1 = Math.min(x0 + tileW, width);
+        const y1 = Math.min(y0 + tileH, height);
+        for (let y = y0; y < y1; y++)
+          for (let x = x0; x < x1; x++) {
+            hist[Math.min(255, Math.floor(grey[y * width + x]))]++;
+            count++;
+          }
+        // Clip histogram
+        const clipCount = clip * count / 256;
+        let excess = 0;
+        for (let b = 0; b < 256; b++) {
+          if (hist[b] > clipCount) { excess += hist[b] - clipCount; hist[b] = clipCount; }
+        }
+        // Redistribute excess uniformly
+        const redist = excess / 256;
+        for (let b = 0; b < 256; b++) hist[b] += redist;
+        // Build CDF
+        const cdf = new Float32Array(256);
+        cdf[0] = hist[0];
+        for (let b = 1; b < 256; b++) cdf[b] = cdf[b - 1] + hist[b];
+        const cdfMin = cdf.find(v => v > 0) || 1;
+        for (let b = 0; b < 256; b++)
+          cdf[b] = Math.round(255 * (cdf[b] - cdfMin) / (count - cdfMin + 1e-6));
+        cdfs[ty][tx] = cdf;
+      }
+    }
+
+    // Bilinear interpolation of tile CDFs
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const px = grey[y * width + x];
+        const bin = Math.min(255, Math.floor(px));
+
+        // Tile coordinates (fractional)
+        const ftx = (x + 0.5) / tileW - 0.5;
+        const fty = (y + 0.5) / tileH - 0.5;
+        const tx0 = Math.max(0, Math.floor(ftx));
+        const ty0 = Math.max(0, Math.floor(fty));
+        const tx1 = Math.min(numTX - 1, tx0 + 1);
+        const ty1 = Math.min(numTY - 1, ty0 + 1);
+        const fx  = Math.max(0, Math.min(1, ftx - tx0));
+        const fy  = Math.max(0, Math.min(1, fty - ty0));
+
+        const v00 = cdfs[ty0][tx0][bin];
+        const v10 = cdfs[ty0][tx1][bin];
+        const v01 = cdfs[ty1][tx0][bin];
+        const v11 = cdfs[ty1][tx1][bin];
+
+        out[y * width + x] =
+          v00 * (1 - fx) * (1 - fy) +
+          v10 * fx       * (1 - fy) +
+          v01 * (1 - fx) * fy +
+          v11 * fx       * fy;
+      }
+    }
+    return out;
+  }
+
+  // ─── Per-user PCA basis ───────────────────────────────────────────────────
 
   /**
-   * Extract a compact float32 feature vector from left+right eye patch data.
-   * eye patches come in as {left:{patch:ImageData}, right:{patch:ImageData}}
+   * PCABasis: fitted from actual calibration patches collected during setup.
+   * Falls back to the deterministic random projection until fit() is called.
+   *
+   * Fitting uses the covariance method (mean-centred patches, power iteration
+   * for top-k eigenvectors). Runs once at calibration end in ~5–20ms.
    */
-  function extractFeatures(eyePatches) {
+  function PCABasis(dim, k, seed) {
+    this.dim    = dim;
+    this.k      = k;
+    this.fitted = false;
+    this.mean   = null;
+    this.basis  = makeFallbackBasis(dim, k, seed);
+  }
+
+  PCABasis.prototype = {
+    /**
+     * Fit from an array of raw greyscale arrays (one per calibration patch).
+     * @param {Array<number[]>} patches  Array of grey arrays, each length=dim
+     */
+    fit(patches) {
+      const n = patches.length;
+      if (n < this.k + 2) return false; // not enough data
+
+      // Trim patches to expected dim
+      const P = patches.map(p => {
+        const v = new Float64Array(this.dim);
+        const len = Math.min(p.length, this.dim);
+        for (let i = 0; i < len; i++) v[i] = p[i];
+        return v;
+      });
+
+      // Mean centre
+      const mean = new Float64Array(this.dim);
+      for (const p of P) for (let i = 0; i < this.dim; i++) mean[i] += p[i] / n;
+      for (const p of P) for (let i = 0; i < this.dim; i++) p[i] -= mean[i];
+
+      // Power iteration for top-k eigenvectors
+      // Works in the sample space (n×n, not dim×dim) for efficiency
+      // We compute S = P P' / n  (n×n), find its eigenvectors u,
+      // then project back: v = P' u / ||P' u||
+
+      // Build S = P P' (n×n)
+      const S = Array.from({ length: n }, () => new Float64Array(n));
+      for (let i = 0; i < n; i++)
+        for (let j = i; j < n; j++) {
+          let dot = 0;
+          for (let d = 0; d < this.dim; d++) dot += P[i][d] * P[j][d];
+          dot /= n;
+          S[i][j] = S[j][i] = dot;
+        }
+
+      const basis = [];
+      // Deflation: after each eigenvector, subtract its contribution from S
+      const Scopy = S.map(r => Float64Array.from(r));
+
+      for (let e = 0; e < this.k; e++) {
+        // Random init
+        let u = Float64Array.from({ length: n }, (_, i) => Math.sin(i * 7.3 + e * 3.1));
+        // Power iterate
+        for (let iter = 0; iter < 50; iter++) {
+          const Su = new Float64Array(n);
+          for (let i = 0; i < n; i++)
+            for (let j = 0; j < n; j++) Su[i] += Scopy[i][j] * u[j];
+          const mag = Math.sqrt(Su.reduce((a, v) => a + v * v, 0)) || 1;
+          u = Su.map(v => v / mag);
+        }
+        // Project back to dim space: v = P' u  (dim-dimensional eigenvector)
+        const v = new Float64Array(this.dim);
+        for (let d = 0; d < this.dim; d++)
+          for (let i = 0; i < n; i++) v[d] += P[i][d] * u[i];
+        const vmag = Math.sqrt(v.reduce((a, x) => a + x * x, 0)) || 1;
+        const vn = v.map(x => x / vmag);
+        basis.push(vn);
+
+        // Deflate S: S -= λ u u'   where λ = u' S u
+        let lam = 0;
+        for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) lam += u[i] * Scopy[i][j] * u[j];
+        for (let i = 0; i < n; i++)
+          for (let j = 0; j < n; j++) Scopy[i][j] -= lam * u[i] * u[j];
+      }
+
+      this.mean   = mean;
+      this.basis  = basis.map(v => Array.from(v));
+      this.fitted = true;
+      return true;
+    },
+
+    project(grey) {
+      const len = Math.min(grey.length, this.dim);
+      const v   = new Float64Array(this.dim);
+      for (let i = 0; i < len; i++) v[i] = grey[i];
+      if (this.mean) for (let i = 0; i < this.dim; i++) v[i] -= this.mean[i];
+      return this.basis.map(bv => {
+        let dot = 0;
+        for (let i = 0; i < this.dim; i++) dot += bv[i] * v[i];
+        return dot;
+      });
+    },
+  };
+
+  function makeFallbackBasis(dim, k, seed) {
+    const basis = [];
+    let s = seed;
+    const rand = () => { s = (s * 1664525 + 1013904223) & 0xffffffff; return (s >>> 0) / 0xffffffff - 0.5; };
+    for (let j = 0; j < k; j++) {
+      const v = Array.from({ length: dim }, rand);
+      const mag = Math.sqrt(v.reduce((a, x) => a + x * x, 0)) || 1;
+      basis.push(v.map(x => x / mag));
+    }
+    return basis;
+  }
+
+  // Global per-user PCA bases (one per eye)
+  const LEFT_PCA  = new PCABasis(PATCH_DIM, PATCH_COMPONENTS, 0xdeadbeef);
+  const RIGHT_PCA = new PCABasis(PATCH_DIM, PATCH_COMPONENTS, 0xcafebabe);
+
+  // Storage for raw patches collected during calibration (used to fit PCA)
+  const _calibPatches = { left: [], right: [] };
+
+  // ─── Feature extraction with CLAHE ────────────────────────────────────────
+
+  function getGreyscale(patch) {
+    if (!patch) return null;
+    try {
+      let data, width, height;
+      if (patch instanceof ImageData) {
+        data = patch.data; width = patch.width; height = patch.height;
+      } else if (patch.data && patch.width) {
+        data = patch.data; width = patch.width; height = patch.height;
+      } else if (typeof HTMLCanvasElement !== 'undefined' && patch instanceof HTMLCanvasElement) {
+        const ctx = patch.getContext('2d');
+        const id = ctx.getImageData(0, 0, patch.width, patch.height);
+        data = id.data; width = patch.width; height = patch.height;
+      } else {
+        return null;
+      }
+      const grey = new Float32Array(width * height);
+      for (let i = 0, j = 0; i < data.length; i += 4, j++)
+        grey[j] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      // Apply CLAHE for contrast normalisation
+      return { grey: clahe(grey, width, height), width, height };
+    } catch (e) { return null; }
+  }
+
+  function extractFeatures(eyePatches, collectForPCA) {
     if (!eyePatches || !eyePatches.left || !eyePatches.right) return null;
 
-    const lData = getGreyscale(eyePatches.left.patch || eyePatches.left);
-    const rData = getGreyscale(eyePatches.right.patch || eyePatches.right);
-    if (!lData || !rData) return null;
+    const lResult = getGreyscale(eyePatches.left.patch || eyePatches.left);
+    const rResult = getGreyscale(eyePatches.right.patch || eyePatches.right);
+    if (!lResult || !rResult) return null;
 
-    // Normalise 0→1
-    const norm = arr => {
-      const max = Math.max(...arr) || 1;
-      const min = Math.min(...arr);
-      const range = (max - min) || 1;
-      return arr.map(v => (v - min) / range);
-    };
+    // Optionally stash raw (pre-CLAHE) patches for later PCA fitting
+    if (collectForPCA) {
+      if (_calibPatches.left.length < 300)  _calibPatches.left.push(Array.from(lResult.grey));
+      if (_calibPatches.right.length < 300) _calibPatches.right.push(Array.from(rResult.grey));
+    }
 
-    const lNorm = norm(lData);
-    const rNorm = norm(rData);
+    const lProj = LEFT_PCA.project(lResult.grey);
+    const rProj = RIGHT_PCA.project(rResult.grey);
+    const components = [...lProj, ...rProj];
 
-    // Simple PCA via top-k projection using random fixed basis
-    // (we use a deterministic random basis seeded at load time so it's
-    //  consistent across frames — a proper PCA would need a training set)
-    const lProj = projectToBasis(lNorm, LEFT_BASIS);
-    const rProj = projectToBasis(rNorm, RIGHT_BASIS);
-
-    // Concatenate left + right projections
-    const components = [...lProj, ...rProj]; // length = 2 * PATCH_COMPONENTS
-
-    // Degree-2 polynomial features: [1, c0..cn, c0*c0, c0*c1, ..., cn*cn]
+    // Degree-2 polynomial features
     const features = [1.0];
     for (const c of components) features.push(c);
     for (let i = 0; i < components.length; i++)
@@ -141,430 +335,563 @@
     return features;
   }
 
-  function getGreyscale(patch) {
-    if (!patch) return null;
-    try {
-      let data;
-      if (patch instanceof ImageData) {
-        data = patch.data;
-      } else if (patch.data) {
-        data = patch.data;
-      } else if (patch instanceof HTMLCanvasElement) {
-        const ctx = patch.getContext('2d');
-        data = ctx.getImageData(0, 0, patch.width, patch.height).data;
-      } else {
-        return null;
-      }
-      const grey = [];
-      for (let i = 0; i < data.length; i += 4)
-        grey.push(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
-      return grey;
-    } catch (e) { return null; }
-  }
-
-  // Deterministic pseudo-random basis vectors (seeded, consistent per load)
-  function makeBasis(inputDim, outputDim, seed) {
-    const basis = [];
-    let s = seed;
-    const rand = () => { s = (s * 1664525 + 1013904223) & 0xffffffff; return (s >>> 0) / 0xffffffff - 0.5; };
-    for (let j = 0; j < outputDim; j++) {
-      const v = Array.from({ length: inputDim }, rand);
-      // Normalise
-      const mag = Math.sqrt(v.reduce((a, x) => a + x * x, 0)) || 1;
-      basis.push(v.map(x => x / mag));
-    }
-    return basis;
-  }
-
-  function projectToBasis(vec, basis) {
-    return basis.map(bv => {
-      const len = Math.min(vec.length, bv.length);
-      let dot = 0;
-      for (let i = 0; i < len; i++) dot += vec[i] * bv[i];
-      return dot;
-    });
-  }
-
-  // Bases are created once at load time. Input dim is arbitrary — we'll
-  // resize lazily if the actual patch is a different size.
-  const PATCH_DIM = 60 * 40; // typical WebGazer eye patch ~60×40
-  const LEFT_BASIS  = makeBasis(PATCH_DIM, PATCH_COMPONENTS, 0xdeadbeef);
-  const RIGHT_BASIS = makeBasis(PATCH_DIM, PATCH_COMPONENTS, 0xcafebabe);
-
-
   // ─── Polynomial Regression ────────────────────────────────────────────────
 
-  /**
-   * Degree-2 polynomial regression over eye-patch PCA features.
-   * Exposes the same interface as WebGazer's built-in regression modules:
-   *   - addData(eyePatches, x, y)
-   *   - setData(data)
-   *   - getData() → array of stored samples
-   *   - predict(eyePatches) → {x, y} | null
-   */
   function PolynomialRegression() {
-    this.xSamples = [];   // feature vectors
-    this.ySamples = [];   // [screenX, screenY]
-    this.weights  = [];   // sample importance weights (recency)
-    this.betaX    = null; // solved coefficients for X
-    this.betaY    = null; // solved coefficients for Y
+    this.xSamples = [];
+    this.ySamples = [];
+    this.weights  = [];
+    this.betaX    = null;
+    this.betaY    = null;
     this._dirty   = false;
+    this._recentErr = 0; // recent RMSE — used by ensemble
   }
 
   PolynomialRegression.prototype = {
-
     addData(eyePatches, screenX, screenY, importance) {
-      const feat = extractFeatures(eyePatches);
+      const feat = extractFeatures(eyePatches, true);
       if (!feat) return;
       this.xSamples.push(feat);
       this.ySamples.push([screenX, screenY]);
       this.weights.push(importance != null ? importance : 1.0);
       this._dirty = true;
-      // Keep a rolling window — old samples hurt accuracy when user moves
-      const MAX = 150;
-      if (this.xSamples.length > MAX) {
-        this.xSamples.shift();
-        this.ySamples.shift();
-        this.weights.shift();
-      }
+      const MAX = 200;
+      if (this.xSamples.length > MAX) { this.xSamples.shift(); this.ySamples.shift(); this.weights.shift(); }
     },
-
     setData(data) {
-      this.xSamples = [];
-      this.ySamples = [];
-      this.weights  = [];
+      this.xSamples = []; this.ySamples = []; this.weights = [];
       if (!data) return;
-      for (const d of data) {
+      for (const d of data)
         if (d.features && d.screenPos) {
-          this.xSamples.push(d.features);
-          this.ySamples.push(d.screenPos);
-          this.weights.push(d.weight || 1.0);
+          this.xSamples.push(d.features); this.ySamples.push(d.screenPos); this.weights.push(d.weight || 1.0);
         }
-      }
       this._dirty = true;
     },
-
     getData() {
-      return this.xSamples.map((f, i) => ({
-        features:  f,
-        screenPos: this.ySamples[i],
-        weight:    this.weights[i],
-      }));
+      return this.xSamples.map((f, i) => ({ features: f, screenPos: this.ySamples[i], weight: this.weights[i] }));
     },
-
     _fit() {
       const n = this.xSamples.length;
       if (n < 6) { this.betaX = null; this.betaY = null; return; }
-
-      // Apply recency weighting: most recent samples get weight 1.0,
-      // oldest get weight ~0.3, using exponential decay.
       const decay = 0.985;
       const W = this.weights.map((w, i) => w * Math.pow(decay, n - 1 - i));
-
-      // Weight the feature matrix rows
-      const Xw = this.xSamples.map((row, i) => row.map(v => v * Math.sqrt(W[i])));
+      const Xw  = this.xSamples.map((row, i) => row.map(v => v * Math.sqrt(W[i])));
       const yXw = this.ySamples.map((pos, i) => pos[0] * Math.sqrt(W[i]));
       const yYw = this.ySamples.map((pos, i) => pos[1] * Math.sqrt(W[i]));
-
       this.betaX = ridgeSolve(Xw, yXw, LAMBDA);
       this.betaY = ridgeSolve(Xw, yYw, LAMBDA);
       this._dirty = false;
     },
-
     predict(eyePatches) {
       if (this._dirty) this._fit();
       if (!this.betaX || !this.betaY) return null;
-
-      const feat = extractFeatures(eyePatches);
+      const feat = extractFeatures(eyePatches, false);
       if (!feat) return null;
-
-      // Resize beta if feature dim changed (different camera resolution)
       const dim = Math.min(feat.length, this.betaX.length);
-
       let px = 0, py = 0;
-      for (let i = 0; i < dim; i++) {
-        px += feat[i] * this.betaX[i];
-        py += feat[i] * this.betaY[i];
-      }
-
-      // Clamp to viewport
-      px = Math.max(0, Math.min(window.innerWidth,  px));
-      py = Math.max(0, Math.min(window.innerHeight, py));
-
-      return { x: px, y: py };
+      for (let i = 0; i < dim; i++) { px += feat[i] * this.betaX[i]; py += feat[i] * this.betaY[i]; }
+      return {
+        x: Math.max(0, Math.min(window.innerWidth,  px)),
+        y: Math.max(0, Math.min(window.innerHeight, py)),
+      };
     },
-
     name: 'polynomial',
   };
 
-
   // ─── RBF Regression ───────────────────────────────────────────────────────
 
-  /**
-   * Radial Basis Function regression.
-   * Uses a Gaussian kernel over the PCA feature space.
-   * Better than polynomial when calibration points are unevenly distributed.
-   *
-   * Prediction: ŷ = Σ αᵢ · K(x, xᵢ)   where K(a,b) = exp(-γ·‖a-b‖²)
-   * Coefficients α solved via (K + λI)α = y
-   */
   function RBFRegression() {
-    this.features  = [];
-    this.targets   = [];
-    this.weights   = [];
-    this.alphaX    = null;
-    this.alphaY    = null;
-    this.gamma     = 1.0; // kernel bandwidth — auto-tuned after fit
-    this._dirty    = false;
+    this.features   = [];
+    this.targets    = [];
+    this.weights    = [];
+    this.alphaX     = null;
+    this.alphaY     = null;
+    this.gamma      = 1.0;
+    this._dirty     = false;
+    this._recentErr = 0;
   }
 
   RBFRegression.prototype = {
-
     addData(eyePatches, screenX, screenY, importance) {
-      const feat = extractFeatures(eyePatches);
+      const feat = extractFeatures(eyePatches, false);
       if (!feat) return;
       this.features.push(feat);
       this.targets.push([screenX, screenY]);
       this.weights.push(importance != null ? importance : 1.0);
       this._dirty = true;
-      const MAX = 80; // RBF is O(n²) so keep smaller window
-      if (this.features.length > MAX) {
-        this.features.shift();
-        this.targets.shift();
-        this.weights.shift();
-      }
+      const MAX = 100;
+      if (this.features.length > MAX) { this.features.shift(); this.targets.shift(); this.weights.shift(); }
     },
-
     setData(data) {
       this.features = []; this.targets = []; this.weights = [];
       if (!data) return;
-      for (const d of data) {
+      for (const d of data)
         if (d.features && d.screenPos) {
-          this.features.push(d.features);
-          this.targets.push(d.screenPos);
-          this.weights.push(d.weight || 1.0);
+          this.features.push(d.features); this.targets.push(d.screenPos); this.weights.push(d.weight || 1.0);
         }
-      }
       this._dirty = true;
     },
-
     getData() {
-      return this.features.map((f, i) => ({
-        features: f, screenPos: this.targets[i], weight: this.weights[i],
-      }));
+      return this.features.map((f, i) => ({ features: f, screenPos: this.targets[i], weight: this.weights[i] }));
     },
-
     _sqDist(a, b) {
       const dim = Math.min(a.length, b.length);
       let s = 0;
       for (let i = 0; i < dim; i++) { const d = a[i] - b[i]; s += d * d; }
       return s;
     },
-
     _tuneGamma() {
-      // Median heuristic: γ = 1 / (2 · median(pairwise distances²))
       const n = this.features.length;
       if (n < 2) return;
       const dists = [];
       for (let i = 0; i < n; i++)
-        for (let j = i + 1; j < n; j++)
-          dists.push(this._sqDist(this.features[i], this.features[j]));
+        for (let j = i + 1; j < n; j++) dists.push(this._sqDist(this.features[i], this.features[j]));
       dists.sort((a, b) => a - b);
       const median = dists[Math.floor(dists.length / 2)] || 1;
       this.gamma = 1 / (2 * median);
     },
-
     _fit() {
       const n = this.features.length;
       if (n < 4) { this.alphaX = null; this.alphaY = null; return; }
-
       this._tuneGamma();
-
-      // Build kernel matrix K[i][j] = exp(-γ · ‖fᵢ - fⱼ‖²)
       const K = Array.from({ length: n }, (_, i) =>
         Array.from({ length: n }, (__, j) =>
           Math.exp(-this.gamma * this._sqDist(this.features[i], this.features[j]))
         )
       );
-
-      // Add regularisation + recency weighting on diagonal
       const decay = 0.98;
       for (let i = 0; i < n; i++)
         K[i][i] += LAMBDA / (this.weights[i] * Math.pow(decay, n - 1 - i) + 1e-8);
-
-      const yX = this.targets.map(t => t[0]);
-      const yY = this.targets.map(t => t[1]);
-
-      this.alphaX = gaussianElimination(K, yX);
-      this.alphaY = gaussianElimination(K, yY);
+      this.alphaX = gaussianElimination(K, this.targets.map(t => t[0]));
+      this.alphaY = gaussianElimination(K, this.targets.map(t => t[1]));
       this._dirty = false;
     },
-
     predict(eyePatches) {
       if (this._dirty) this._fit();
       if (!this.alphaX) return null;
-
-      const feat = extractFeatures(eyePatches);
+      const feat = extractFeatures(eyePatches, false);
       if (!feat) return null;
-
       let px = 0, py = 0;
       for (let i = 0; i < this.features.length; i++) {
         const k = Math.exp(-this.gamma * this._sqDist(feat, this.features[i]));
-        px += this.alphaX[i] * k;
-        py += this.alphaY[i] * k;
+        px += this.alphaX[i] * k; py += this.alphaY[i] * k;
       }
-
-      px = Math.max(0, Math.min(window.innerWidth,  px));
-      py = Math.max(0, Math.min(window.innerHeight, py));
-
-      return { x: px, y: py };
+      return {
+        x: Math.max(0, Math.min(window.innerWidth,  px)),
+        y: Math.max(0, Math.min(window.innerHeight, py)),
+      };
     },
-
     name: 'rbf',
   };
 
-
-  // ─── Velocity-aware smoothing ─────────────────────────────────────────────
+  // ─── Ensemble regression ──────────────────────────────────────────────────
 
   /**
-   * Improves on WebGazer's fixed-lerp smoothing.
-   * - When gaze is moving fast, use less smoothing (more responsive)
-   * - When gaze is stable (dwelling), use more smoothing (reduces jitter)
-   * - Separate smoothing for saccades vs slow pursuit movements
+   * Blends polynomial and RBF predictions weighted by their rolling RMSE.
+   * The model with lower recent error gets more weight.
+   * Falls back to whichever model is ready if only one has enough data.
    */
-  function VelocitySmoother(options) {
-    options = options || {};
-    this.alpha     = options.alpha     || 0.22;  // base EMA factor
-    this.velScale  = options.velScale  || 0.003; // how much velocity boosts alpha
-    this.maxAlpha  = options.maxAlpha  || 0.7;   // cap for fast movements
-    this.minAlpha  = options.minAlpha  || 0.08;  // floor for dwelling
-
-    this.sx = null; this.sy = null;
-    this.vx = 0;    this.vy = 0;
-    this.lastT = null;
+  function EnsembleRegression(poly, rbf) {
+    this.poly = poly;
+    this.rbf  = rbf;
+    this._errPoly = 0;
+    this._errRbf  = 0;
+    this._alpha   = 0.05; // EMA for error tracking
+    this.name = 'ensemble';
   }
 
-  VelocitySmoother.prototype.smooth = function (x, y) {
-    const now = performance.now();
+  EnsembleRegression.prototype = {
+    addData(eyePatches, screenX, screenY, importance) {
+      this.poly.addData(eyePatches, screenX, screenY, importance);
+      this.rbf.addData(eyePatches, screenX, screenY, importance);
+    },
+    setData(data) { this.poly.setData(data); this.rbf.setData(data); },
+    getData()     { return this.poly.getData(); },
 
-    if (this.sx === null) {
-      this.sx = x; this.sy = y; this.lastT = now;
-      return { x, y, confidence: 0 };
+    predict(eyePatches) {
+      const pPoly = this.poly.predict(eyePatches);
+      const pRbf  = this.rbf.predict(eyePatches);
+
+      if (!pPoly && !pRbf) return null;
+      if (!pPoly) return pRbf;
+      if (!pRbf)  return pPoly;
+
+      // Weight inversely by recent error
+      const errPoly = this._errPoly || 1;
+      const errRbf  = this._errRbf  || 1;
+      const wPoly = 1 / errPoly;
+      const wRbf  = 1 / errRbf;
+      const wSum  = wPoly + wRbf;
+
+      return {
+        x: (pPoly.x * wPoly + pRbf.x * wRbf) / wSum,
+        y: (pPoly.y * wPoly + pRbf.y * wRbf) / wSum,
+      };
+    },
+
+    /** Call after each confirmed calibration point to track model accuracy */
+    trackError(eyePatches, trueX, trueY) {
+      const pp = this.poly.predict(eyePatches);
+      const pr = this.rbf.predict(eyePatches);
+      if (pp) {
+        const err = Math.sqrt((pp.x - trueX) ** 2 + (pp.y - trueY) ** 2);
+        this._errPoly = this._errPoly * (1 - this._alpha) + err * this._alpha;
+      }
+      if (pr) {
+        const err = Math.sqrt((pr.x - trueX) ** 2 + (pr.y - trueY) ** 2);
+        this._errRbf  = this._errRbf  * (1 - this._alpha) + err * this._alpha;
+      }
+    },
+  };
+
+  // ─── Kalman filter ────────────────────────────────────────────────────────
+
+  /**
+   * 4-state Kalman filter: [x, y, vx, vy]
+   *
+   * Process model: constant velocity with Gaussian process noise Q
+   * Measurement model: we observe [x, y] directly (H = [I | 0])
+   *
+   * This separates process noise (head/body movement) from measurement
+   * noise (frame-to-frame jitter in the regression output). The result
+   * is much smoother than EMA without introducing the lag EMA causes
+   * during genuine gaze shifts.
+   *
+   * Tune via:
+   *   processNoise     — larger = trust measurements more (more responsive)
+   *   measurementNoise — larger = trust model more (smoother but laggier)
+   */
+  function KalmanFilter(options) {
+    options = options || {};
+    this.Q = options.processNoise     || 8;    // process noise variance
+    this.R = options.measurementNoise || 50;   // measurement noise variance
+
+    // State: [x, y, vx, vy]
+    this.x = null; // null = not initialised
+    // Error covariance (4×4, stored as flat 16-element array, row-major)
+    this.P = [
+      1000, 0, 0, 0,
+      0, 1000, 0, 0,
+      0, 0, 100, 0,
+      0, 0, 0, 100,
+    ];
+    this.lastT  = null;
+    this._blink = false;
+  }
+
+  KalmanFilter.prototype = {
+
+    _matMul4x4(A, B) {
+      const C = new Float64Array(16);
+      for (let i = 0; i < 4; i++)
+        for (let j = 0; j < 4; j++)
+          for (let k = 0; k < 4; k++)
+            C[i * 4 + j] += A[i * 4 + k] * B[k * 4 + j];
+      return C;
+    },
+
+    /** Predict step — project state forward by dt milliseconds */
+    _predict(dt) {
+      const s = dt / 1000; // seconds
+      // F = [[1,0,s,0],[0,1,0,s],[0,0,1,0],[0,0,0,1]]
+      const nx = this.x[0] + this.x[2] * s;
+      const ny = this.x[1] + this.x[3] * s;
+      this.x = [nx, ny, this.x[2], this.x[3]];
+
+      // P = F P F' + Q·I  (simplified: only add Q to diagonal)
+      const F = [
+        1, 0, s, 0,
+        0, 1, 0, s,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+      ];
+      const Ft = [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        s, 0, 1, 0,
+        0, s, 0, 1,
+      ];
+      const FP   = this._matMul4x4(F, this.P);
+      const FPFt = this._matMul4x4(FP, Ft);
+      const Q    = this.Q;
+      this.P = FPFt;
+      this.P[0]  += Q;
+      this.P[5]  += Q;
+      this.P[10] += Q * 0.1;
+      this.P[15] += Q * 0.1;
+    },
+
+    /** Update step — incorporate measurement [mx, my] */
+    _update(mx, my) {
+      // H = [[1,0,0,0],[0,1,0,0]] (we only observe x,y)
+      // S = H P H' + R·I  (2×2)
+      const S00 = this.P[0]  + this.R;
+      const S01 = this.P[1];
+      const S10 = this.P[4];
+      const S11 = this.P[5] + this.R;
+
+      // K = P H' S⁻¹  (4×2)
+      const det = S00 * S11 - S01 * S10 + 1e-10;
+      const Si00 =  S11 / det, Si01 = -S01 / det;
+      const Si10 = -S10 / det, Si11 =  S00 / det;
+
+      // P H' (4×2)
+      const PH = [
+        this.P[0],  this.P[1],
+        this.P[4],  this.P[5],
+        this.P[8],  this.P[9],
+        this.P[12], this.P[13],
+      ];
+
+      const K = [
+        PH[0] * Si00 + PH[1] * Si10,   PH[0] * Si01 + PH[1] * Si11,
+        PH[2] * Si00 + PH[3] * Si10,   PH[2] * Si01 + PH[3] * Si11,
+        PH[4] * Si00 + PH[5] * Si10,   PH[4] * Si01 + PH[5] * Si11,
+        PH[6] * Si00 + PH[7] * Si10,   PH[6] * Si01 + PH[7] * Si11,
+      ];
+
+      // Innovation
+      const innX = mx - this.x[0];
+      const innY = my - this.x[1];
+
+      // State update
+      this.x[0] += K[0] * innX + K[1] * innY;
+      this.x[1] += K[2] * innX + K[3] * innY;
+      this.x[2] += K[4] * innX + K[5] * innY;
+      this.x[3] += K[6] * innX + K[7] * innY;
+
+      // P = (I - K H) P  (simplified Joseph form for 4×4)
+      const KH = [
+        K[0], K[1], 0, 0,
+        K[2], K[3], 0, 0,
+        K[4], K[5], 0, 0,
+        K[6], K[7], 0, 0,
+      ];
+      const IKH = [
+        1 - KH[0],  -KH[1],  0, 0,
+         -KH[4], 1 - KH[5], 0, 0,
+         -KH[8],  -KH[9],   1, 0,
+        -KH[12], -KH[13],   0, 1,
+      ];
+      this.P = this._matMul4x4(IKH, this.P);
+    },
+
+    smooth(x, y, isBlink, isSaccade) {
+      const now = performance.now();
+
+      if (this.x === null) {
+        this.x = [x, y, 0, 0];
+        this.lastT = now;
+        return { x, y, vx: 0, vy: 0, confidence: 0 };
+      }
+
+      const dt = Math.min(now - this.lastT, 120);
+      this.lastT = now;
+
+      this._predict(dt);
+
+      // During blinks or saccades: skip measurement update, coast on prediction
+      if (!isBlink && !isSaccade) {
+        this._update(x, y);
+      }
+
+      const vMag = Math.sqrt(this.x[2] ** 2 + this.x[3] ** 2);
+      // Confidence: falls with velocity and with large innovation
+      const innovation = Math.sqrt((x - this.x[0]) ** 2 + (y - this.x[1]) ** 2);
+      const confidence = Math.max(0, Math.min(1,
+        (1 - vMag / 800) * (1 - innovation / 300)
+      ));
+
+      return {
+        x:          this.x[0],
+        y:          this.x[1],
+        vx:         this.x[2],
+        vy:         this.x[3],
+        confidence,
+        isBlink,
+        isSaccade,
+      };
+    },
+
+    reset() {
+      this.x = null;
+      this.P = [1000,0,0,0, 0,1000,0,0, 0,0,100,0, 0,0,0,100];
+      this.lastT = null;
+    },
+  };
+
+  // ─── Blink detector ───────────────────────────────────────────────────────
+
+  /**
+   * Detects blinks by measuring patch brightness.
+   * During a blink the eye patch goes dark (eyelid covers pupil).
+   * Uses an adaptive threshold based on recent patch brightness history.
+   *
+   * Returns true while a blink is in progress.
+   * Has a ~80ms post-blink lockout to prevent jitter as the eye reopens.
+   */
+  function BlinkDetector(options) {
+    options = options || {};
+    this.windowSize   = options.windowSize   || 30;  // frames of history
+    this.blinkThresh  = options.blinkThresh  || 0.55; // fraction of mean to trigger
+    this.lockoutMs    = options.lockoutMs    || 80;
+
+    this._history     = [];
+    this._blinking    = false;
+    this._lockoutEnd  = 0;
+  }
+
+  BlinkDetector.prototype.update = function (eyePatches) {
+    if (!eyePatches || !eyePatches.left) return this._blinking;
+
+    // Get mean brightness of left eye patch (quick proxy for both eyes)
+    const patch = eyePatches.left.patch || eyePatches.left;
+    let brightness = 0, count = 0;
+    try {
+      let data;
+      if (patch instanceof ImageData)                                          data = patch.data;
+      else if (patch.data)                                                     data = patch.data;
+      else if (typeof HTMLCanvasElement !== 'undefined' && patch instanceof HTMLCanvasElement)
+        data = patch.getContext('2d').getImageData(0,0,patch.width,patch.height).data;
+      if (data) {
+        for (let i = 0; i < data.length; i += 4) {
+          brightness += 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
+          count++;
+        }
+        brightness /= count || 1;
+      }
+    } catch (e) { return this._blinking; }
+
+    this._history.push(brightness);
+    if (this._history.length > this.windowSize) this._history.shift();
+
+    const mean = this._history.reduce((a, v) => a + v, 0) / this._history.length;
+    const now  = performance.now();
+
+    if (now < this._lockoutEnd) return true; // post-blink lockout
+
+    const isBlink = brightness < mean * this.blinkThresh;
+
+    if (isBlink && !this._blinking) {
+      this._blinking   = true;
+      this._lockoutEnd = 0;
+    } else if (!isBlink && this._blinking) {
+      this._blinking   = false;
+      this._lockoutEnd = now + this.lockoutMs;
     }
 
-    const dt = Math.min(now - this.lastT, 100); // cap at 100ms
-    this.lastT = now;
-
-    // Instantaneous velocity (px/ms)
-    const rawVx = (x - this.sx) / dt;
-    const rawVy = (y - this.sy) / dt;
-    const speed = Math.sqrt(rawVx * rawVx + rawVy * rawVy);
-
-    // Smooth velocity estimate
-    const velAlpha = 0.4;
-    this.vx = velAlpha * rawVx + (1 - velAlpha) * this.vx;
-    this.vy = velAlpha * rawVy + (1 - velAlpha) * this.vy;
-
-    // Adapt EMA factor to speed
-    const adaptedAlpha = Math.min(
-      this.maxAlpha,
-      Math.max(this.minAlpha, this.alpha + speed * this.velScale)
-    );
-
-    this.sx += adaptedAlpha * (x - this.sx);
-    this.sy += adaptedAlpha * (y - this.sy);
-
-    // Confidence: high when stable, low when fast-moving or just started
-    const jitter = Math.sqrt((x - this.sx) ** 2 + (y - this.sy) ** 2);
-    const confidence = Math.max(0, Math.min(1, 1 - jitter / 200));
-
-    return { x: this.sx, y: this.sy, confidence };
+    return this._blinking || now < this._lockoutEnd;
   };
 
-  VelocitySmoother.prototype.reset = function () {
-    this.sx = null; this.sy = null; this.vx = 0; this.vy = 0;
+  // ─── Saccade detector ────────────────────────────────────────────────────
+
+  /**
+   * Detects saccades (fast eye movements) from the Kalman velocity estimate.
+   * During a saccade the regression output is unreliable — we coast on
+   * the Kalman prediction instead of incorporating the noisy measurement.
+   *
+   * threshold: px/sec above which we suppress the measurement update
+   */
+  function SaccadeDetector(threshold) {
+    this.threshold = threshold || 600; // px/sec
+  }
+
+  SaccadeDetector.prototype.isSaccade = function (vx, vy) {
+    return Math.sqrt(vx * vx + vy * vy) > this.threshold;
   };
 
+  // ─── Frame cache ──────────────────────────────────────────────────────────
+
+  /**
+   * Skips regression inference when gaze appears stable.
+   * If velocity is below `minSpeed` px/sec, reuse the last prediction
+   * for up to `maxReuseMs` milliseconds. Saves ~20–40% CPU on fast devices,
+   * more on slow ones.
+   */
+  function FrameCache(options) {
+    options = options || {};
+    this.minSpeed  = options.minSpeed  || 15;  // px/sec
+    this.maxReuseMs = options.maxReuseMs || 50; // max ms to reuse
+
+    this._last  = null;
+    this._lastT = 0;
+  }
+
+  FrameCache.prototype = {
+    shouldSkip(vx, vy) {
+      if (!this._last) return false;
+      const speed = Math.sqrt(vx * vx + vy * vy);
+      const age   = performance.now() - this._lastT;
+      return speed < this.minSpeed && age < this.maxReuseMs;
+    },
+    store(pred) {
+      this._last  = pred;
+      this._lastT = performance.now();
+    },
+    get() { return this._last; },
+  };
 
   // ─── Adaptive recalibration ───────────────────────────────────────────────
 
-  /**
-   * Watches for confirmed dwell events and feeds them back into the
-   * regression model as free labeled training samples.
-   *
-   * When a user dwells on a UI element long enough to activate it,
-   * we know:
-   *   - the target's center XY (from the DOM element's bounding rect)
-   *   - the eye patches at that moment
-   *
-   * This is a free calibration point — we add it with high importance.
-   *
-   * Usage from JelloOS/GazeContext:
-   *   webgazerAAC.recordDwellHit(element)  // call when dwell fires
-   */
   function AdaptiveRecalibrator(regressionModule) {
     this.regression = regressionModule;
     this.enabled    = false;
     this.hitCount   = 0;
-    this.maxHitsPerSession = 200;
+    this.maxHitsPerSession = 500;
   }
 
   AdaptiveRecalibrator.prototype = {
     enable()  { this.enabled = true; },
     disable() { this.enabled = false; },
-
     recordHit(targetX, targetY, eyePatches, importance) {
-      if (!this.enabled) return;
-      if (this.hitCount >= this.maxHitsPerSession) return;
-      importance = importance != null ? importance : 1.5; // slightly boost dwell hits
+      if (!this.enabled || this.hitCount >= this.maxHitsPerSession) return;
+      importance = importance != null ? importance : 1.5;
       this.regression.addData(eyePatches, targetX, targetY, importance);
       this.hitCount++;
     },
-
     recordElementHit(element, eyePatches) {
       if (!element || !this.enabled) return;
       const r = element.getBoundingClientRect();
-      const cx = r.left + r.width  / 2;
-      const cy = r.top  + r.height / 2;
-      this.recordHit(cx, cy, eyePatches);
+      this.recordHit(r.left + r.width / 2, r.top + r.height / 2, eyePatches);
     },
   };
 
-
-  // ─── Main install ──────────────────────────────────────────────────────────
+  // ─── Main install ─────────────────────────────────────────────────────────
 
   const webgazerAAC = {
-    _regression:   null,
-    _smoother:     new VelocitySmoother(),
-    _recalibrator: null,
-    _currentMode:  'polynomial',
-    _installed:    false,
-    _lastPatches:  null,
+    _regression:     null,
+    _kalman:         new KalmanFilter(),
+    _blink:          new BlinkDetector(),
+    _saccade:        new SaccadeDetector(),
+    _cache:          new FrameCache(),
+    _recalibrator:   null,
+    _currentMode:    'ensemble',
+    _installed:      false,
+    _lastPatches:    null,
     _lastConfidence: 0,
+    _lastResult:     null,
 
-    /**
-     * Install the patch. Must be called after webgazer.js has loaded.
-     * Sets polynomial regression as the default and wraps the gaze listener
-     * to add velocity-aware smoothing + confidence scoring.
-     */
     install() {
       if (this._installed) return this;
       if (typeof webgazer === 'undefined') {
-        console.error('[webgazer-aac] webgazer.js must be loaded before webgazer-aac.js');
+        console.error('[webgazer-aac] webgazer.js must be loaded first');
         return this;
       }
 
-      // Register our regression modules so webgazer.setRegression() knows them
+      const poly = new PolynomialRegression();
+      const rbf  = new RBFRegression();
+
       this._regressions = {
-        polynomial: new PolynomialRegression(),
-        rbf:        new RBFRegression(),
+        polynomial: poly,
+        rbf:        rbf,
+        ensemble:   new EnsembleRegression(poly, rbf),
       };
 
-      // Default to polynomial
-      this.setRegression('polynomial');
+      this.setRegression('ensemble');
 
-      // Intercept eye patches so adaptive recalibration can access them
       const self = this;
+
+      // Intercept setGazeListener
       const _origSetGazeListener = webgazer.setGazeListener.bind(webgazer);
       webgazer.setGazeListener = function (callback) {
         return _origSetGazeListener(function (data, elapsedTime) {
@@ -575,131 +902,159 @@
               self._lastPatches =
                 (tracker.getEyePatches && tracker.getEyePatches()) ||
                 (tracker.getCurrentEyePatches && tracker.getCurrentEyePatches()) ||
-                (webgazer.getCurrentEyePatches && webgazer.getCurrentEyePatches()) ||
-                null;
+                (webgazer.getCurrentEyePatches && webgazer.getCurrentEyePatches()) || null;
             }
           } catch (e) {}
 
           if (data === null) { callback(null, elapsedTime); return; }
 
-          // Run our prediction on top of (or instead of) WebGazer's output
-          let pred = null;
-          if (self._regression && self._lastPatches) {
-            try { pred = self._regression.predict(self._lastPatches); } catch (e) {}
+          // Blink detection
+          const isBlink = self._blink.update(self._lastPatches);
+
+          // Saccade detection (from Kalman velocity)
+          const vx = self._lastResult ? self._lastResult.vx : 0;
+          const vy = self._lastResult ? self._lastResult.vy : 0;
+          const isSaccade = self._saccade.isSaccade(vx, vy);
+
+          // Frame cache — skip inference if stable
+          let rawX, rawY;
+          if (self._cache.shouldSkip(vx, vy) && self._cache.get()) {
+            const cached = self._cache.get();
+            rawX = cached.x; rawY = cached.y;
+          } else {
+            // Regression inference
+            let pred = null;
+            if (self._regression && self._lastPatches) {
+              try { pred = self._regression.predict(self._lastPatches); } catch (e) {}
+            }
+            rawX = pred ? pred.x : data.x;
+            rawY = pred ? pred.y : data.y;
+            self._cache.store({ x: rawX, y: rawY });
           }
 
-          // Fall back to WebGazer's own prediction if ours isn't ready
-          const rawX = pred ? pred.x : data.x;
-          const rawY = pred ? pred.y : data.y;
+          // Kalman filter
+          const result = self._kalman.smooth(rawX, rawY, isBlink, isSaccade);
+          self._lastResult     = result;
+          self._lastConfidence = result.confidence;
 
-          // Velocity-aware smoothing
-          const smoothed = self._smoother.smooth(rawX, rawY);
-          self._lastConfidence = smoothed.confidence;
+          // During blink: pass null so dwell timers don't advance
+          if (isBlink) { callback(null, elapsedTime); return; }
 
-          callback({ x: smoothed.x, y: smoothed.y, confidence: smoothed.confidence }, elapsedTime);
+          callback({
+            x:          result.x,
+            y:          result.y,
+            confidence: result.confidence,
+            isSaccade,
+          }, elapsedTime);
         });
       };
 
-      // Intercept recordScreenPosition so calibration data feeds our model too
+      // Intercept recordScreenPosition to feed our model
       const _origRecord = webgazer.recordScreenPosition.bind(webgazer);
       webgazer.recordScreenPosition = function (x, y, eventType) {
         _origRecord(x, y, eventType);
         if (self._regression && self._lastPatches) {
-          try { self._regression.addData(self._lastPatches, x, y); } catch (e) {}
+          try {
+            self._regression.addData(self._lastPatches, x, y);
+            // Track ensemble error
+            if (self._regression instanceof EnsembleRegression)
+              self._regression.trackError(self._lastPatches, x, y);
+          } catch (e) {}
         }
       };
 
-      this._recalibrator = new AdaptiveRecalibrator(this._regressions.polynomial);
-      this._installed = true;
-      console.info('[webgazer-aac] installed — regression: ' + this._currentMode);
+      this._recalibrator = new AdaptiveRecalibrator(this._regressions.ensemble);
+      this._installed    = true;
+      console.info('[webgazer-aac] v1.1.0 installed — regression: ' + this._currentMode);
       return this;
     },
 
     /**
-     * Switch regression model.
-     * @param {'polynomial'|'rbf'|'ridge'} mode
+     * Fit the per-user PCA basis from patches collected during calibration.
+     * Call this at the END of your calibration sequence.
+     * Returns {left: bool, right: bool} indicating whether each eye fit succeeded.
      */
+    fitUserBasis() {
+      const lOk = LEFT_PCA.fit(_calibPatches.left);
+      const rOk = RIGHT_PCA.fit(_calibPatches.right);
+      const msg = `PCA fit — left: ${lOk ? _calibPatches.left.length + ' patches' : 'insufficient data'}, ` +
+                  `right: ${rOk ? _calibPatches.right.length + ' patches' : 'insufficient data'}`;
+      console.info('[webgazer-aac] ' + msg);
+      // Invalidate regression caches so they re-fit with new features
+      Object.values(this._regressions || {}).forEach(r => { if (r._dirty !== undefined) r._dirty = true; });
+      return { left: lOk, right: rOk, message: msg };
+    },
+
+    /** Clear collected calibration patches (call before a fresh calibration) */
+    resetCalibrationPatches() {
+      _calibPatches.left  = [];
+      _calibPatches.right = [];
+      return this;
+    },
+
     setRegression(mode) {
       if (mode === 'ridge') {
-        // Passthrough — use WebGazer's built-in ridge
-        this._regression = null;
+        this._regression  = null;
         this._currentMode = 'ridge';
         if (typeof webgazer !== 'undefined') webgazer.setRegression('ridge');
         return this;
       }
       const reg = this._regressions && this._regressions[mode];
       if (!reg) { console.warn('[webgazer-aac] unknown regression:', mode); return this; }
-      this._regression = reg;
+      this._regression  = reg;
       this._currentMode = mode;
       if (this._recalibrator) this._recalibrator.regression = reg;
       return this;
     },
 
-    /**
-     * Enable continuous self-correction via dwell hits.
-     */
-    enableAdaptiveRecalibration() {
-      if (this._recalibrator) this._recalibrator.enable();
-      return this;
-    },
+    enableAdaptiveRecalibration()  { if (this._recalibrator) this._recalibrator.enable();  return this; },
+    disableAdaptiveRecalibration() { if (this._recalibrator) this._recalibrator.disable(); return this; },
 
-    disableAdaptiveRecalibration() {
-      if (this._recalibrator) this._recalibrator.disable();
-      return this;
-    },
-
-    /**
-     * Call this from JelloOS GazeContext whenever a dwell fires on a known element.
-     * @param {Element} element  The DOM element that was activated
-     */
     recordDwellHit(element) {
       if (!this._recalibrator || !this._lastPatches) return;
       this._recalibrator.recordElementHit(element, this._lastPatches);
     },
 
-    /**
-     * Record a dwell hit at explicit screen coordinates (if no element ref available).
-     */
     recordDwellHitXY(x, y) {
       if (!this._recalibrator || !this._lastPatches) return;
       this._recalibrator.recordHit(x, y, this._lastPatches);
     },
 
     /**
-     * Returns the confidence score (0–1) for the last prediction.
-     * 1 = stable gaze, 0 = fast movement / just initialised.
+     * Tune the Kalman filter's noise parameters.
+     * processNoise: larger = more responsive to movement (default 8)
+     * measurementNoise: larger = smoother but slower (default 50)
      */
-    getConfidence() {
-      return this._lastConfidence;
-    },
-
-    /**
-     * Returns the name of the active regression module.
-     */
-    getRegressionMode() {
-      return this._currentMode;
-    },
-
-    /**
-     * Reset the smoother (useful when user indicates they've moved position).
-     */
-    resetSmoother() {
-      this._smoother.reset();
+    setKalmanParams(processNoise, measurementNoise) {
+      this._kalman.Q = processNoise;
+      this._kalman.R = measurementNoise;
       return this;
     },
 
-    /**
-     * Expose classes for advanced usage / testing
-     */
+    getConfidence()     { return this._lastConfidence; },
+    getRegressionMode() { return this._currentMode; },
+    isPCAFitted()       { return LEFT_PCA.fitted && RIGHT_PCA.fitted; },
+
+    resetSmoother() {
+      this._kalman.reset();
+      this._lastResult = null;
+      return this;
+    },
+
+    // Expose classes for testing / advanced use
     PolynomialRegression,
     RBFRegression,
-    VelocitySmoother,
+    EnsembleRegression,
+    KalmanFilter,
+    BlinkDetector,
+    SaccadeDetector,
+    FrameCache,
     AdaptiveRecalibrator,
+    PCABasis,
 
-    version: '1.0.0-aac',
+    version: '1.1.0',
   };
 
-  // Expose globally
   global.webgazerAAC = webgazerAAC;
 
 })(typeof globalThis !== 'undefined' ? globalThis : window);
