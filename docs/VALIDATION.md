@@ -26,6 +26,8 @@ The current suite verifies:
 14. preconfigured stores survive idempotent install;
 15. diagnostics expose quality and drift as separate signals.
 
+The integration audit additionally checks fallback operation without eye features, regression-mode switching, pre-training drift evaluation, viewport-change validation, and `requestVideoFrameCallback()` lifecycle behavior.
+
 Run:
 
 ```bash
@@ -33,6 +35,16 @@ npm test
 ```
 
 No third-party test framework is required.
+
+### Current automated result — 2026-08-16
+
+The exact v2 runtime committed on `agent/webgazer-aac-v2` as Git blob `471e37e4dcd0dff4c7fa20f1e81e8aac4b29463c` was exercised with both test groups:
+
+- invariant suite: **22 passed, 0 failed**;
+- integration audit: **10 passed, 0 failed**;
+- combined: **32 passed, 0 failed**.
+
+This is code-level evidence only. Browser/webcam and human interaction validation remain open release gates below.
 
 ## Browser validation still required
 
