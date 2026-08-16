@@ -36,6 +36,16 @@
       <article><span>Eye features</span><strong id="coverage">0%</strong></article>
     </section>
 
+    <section class="statusGrid geometryGrid" aria-label="Pose-aware eye geometry">
+      <article><span>Eye ROI validity</span><strong id="eyeRoiValidity">0%</strong></article>
+      <article><span>Relative pose</span><strong id="poseState">waiting</strong></article>
+      <article><span>Roll</span><strong id="poseRoll">0°</strong></article>
+      <article><span>Raw saccades</span><strong id="rawSaccadeRate">0%</strong></article>
+      <article><span>Filtered saccades</span><strong id="filteredSaccadeRate">0%</strong></article>
+      <article><span>Camera alignment</span><strong id="alignmentState">waiting</strong></article>
+    </section>
+    <p id="alignmentHint" class="hint">FaceMesh geometry will report relative camera/head placement after tracking begins. Moderate off-axis positions are supported and recorded rather than silently rejected.</p>
+
     <section class="validationGrid" aria-label="Browser beta validation state">
       <article><span>WebGazer identity</span><strong id="identityGate">NOT VERIFIED</strong></article>
       <article><span>MediaPipe assets</span><strong id="mediaPipeGate">NOT VERIFIED</strong></article>
@@ -48,7 +58,7 @@
     <section class="workspace">
       <article class="panel calibrationPanel">
         <div class="panelHead">
-          <div><p class="eyebrow">CALIBRATION</p><h2>Look, then click each point</h2></div>
+          <div><p class="eyebrow">CALIBRATION</p><h2>Look, then click each point twice</h2></div>
           <div class="fitControl">
             <strong id="fitState" class="fitState">PCA NOT FITTED</strong>
             <button id="fitBtn" disabled>Fit user basis</button>
