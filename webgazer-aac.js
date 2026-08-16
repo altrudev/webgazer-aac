@@ -1,1750 +1,1348 @@
 /**
- * webgazer-aac.js  v1.3.0
- * Accessibility-first enhancement layer for WebGazer.js
+ * webgazer-aac.js v2.0.0
+ * Local-first AAC reliability and gaze interaction layer for WebGazer.js 3.5.3.
  *
- * Fork/patch by ALTRU.dev — Code for Humanity
- * https://altru.dev  |  github.com/altru-dev/webgazer-aac
+ * GPLv3 — ALTRU.dev / Code for Humanity
  *
- * License: GPLv3 (same as upstream brownhci/WebGazer)
- *
- * USAGE:
- *   Load AFTER webgazer.js. Then call:
- *     webgazerAAC.install()
- *     webgazerAAC.setRegression('ensemble')   // or 'polynomial', 'rbf', 'ridge'
- *     webgazerAAC.enableAdaptiveRecalibration()
- *     webgazerAAC.enableDriftWatchdog()       // optional: auto-detect model staleness
- *
- *   At calibration end, call:
- *     webgazerAAC.fitUserBasis()              // fits per-user PCA from collected patches
- *     await webgazerAAC.saveCalibration()     // persist to IndexedDB
- *
- *   On page load (before webgazer.begin()):
- *     const loaded = await webgazerAAC.loadCalibration();
- *     if (loaded) { ... skip calibration UI ... }
- *
- *   Dwell gating:
- *     const timer = webgazerAAC.createDwellTimer({ dwellMs: 800 });
- *     timer.update(element, gazeX, gazeY, confidence, isSaccade, isBlink);
- *
- *   Everything else (webgazer.begin(), setGazeListener(), etc.) stays identical.
- *
- * IMPROVEMENTS IN v1.3.0 OVER v1.2.0:
- *   9.  Confidence-gated dwell — DwellTimer class; pauses progress when Kalman
- *                                confidence is below threshold; emits
- *                                webgazer-aac:dwell-progress / complete / cancel
- *  10.  IndexedDB persistence  — CalibrationStore class; saves/loads regression
- *                                datasets, PCA basis, and Kalman params across
- *                                sessions; graceful fallback in private browsing
- *
- * IMPROVEMENTS IN v1.2.0 OVER v1.1.0:
- *   8. Drift watchdog      — rolling residual tracker; emits 'webgazer-aac:drift-warning'
- *                            and 'webgazer-aac:drift-critical' CustomEvents when the
- *                            regression model silently degrades mid-session
- *
- * IMPROVEMENTS IN v1.1.0 OVER v1.0.0:
- *   1. Per-user PCA basis  — fitted from actual calibration patches, replaces
- *                            fixed random projection → better feature quality
- *   2. CLAHE normalisation — adaptive contrast on eye patches before feature
- *                            extraction → works in poor lighting
- *   3. Kalman filter       — replaces EMA smoother; separates process noise
- *                            from measurement noise → less jitter, better tracking
- *   4. Blink detection     — pauses gaze output during blinks → no false dwell fires
- *   5. Saccade suppression — holds last stable position during fast eye movements
- *   6. Ensemble regression — blends polynomial + RBF weighted by recent accuracy
- *   7. Frame cache         — skips inference when gaze is stable → saves CPU
+ * Design invariants:
+ *   - consume the exact WebGazer data.eyeFeatures used for each prediction
+ *   - never mix regression vectors encoded in different PCA feature spaces
+ *   - never recycle the model's gaze coordinate as independent dwell ground truth
+ *   - keep tracking quality, target confidence, and supervision provenance separate
+ *   - perform no network requests or telemetry
  */
-
-(function (global) {
+(function (root, factory) {
+  const api = factory(root);
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  root.webgazerAAC = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (global) {
   'use strict';
 
-  // ─── Constants ────────────────────────────────────────────────────────────
+  const LIBRARY_VERSION = '2.0.0';
+  const SCHEMA_VERSION = 2;
+  const FEATURE_VERSION = 'wg-aac-v2:norm40x24:pca10:poly2';
+  const NORM_W = 40;
+  const NORM_H = 24;
+  const PATCH_DIM = NORM_W * NORM_H;
+  const PCA_COMPONENTS = 10;
+  const RIDGE_LAMBDA = 1e-3;
 
-  const PATCH_COMPONENTS = 10;  // components per eye (was 8)
-  const LAMBDA           = 1e-3;
-  const PATCH_DIM        = 60 * 40;
+  const EVIDENCE_WEIGHTS = Object.freeze({
+    calibration: 1.0,
+    explicit: 1.0,
+    'confirmed-click': 0.85,
+    'dwell-selection': 0.35,
+    inferred: 0.15,
+  });
 
-  // ─── Math utilities ───────────────────────────────────────────────────────
-
-  function ridgeSolve(X, y, lambda) {
-    const n = X.length, m = X[0].length;
-    const XtX = Array.from({ length: m }, () => new Float64Array(m));
-    for (let i = 0; i < m; i++)
-      for (let j = 0; j < m; j++)
-        for (let k = 0; k < n; k++)
-          XtX[i][j] += X[k][i] * X[k][j];
-    for (let i = 0; i < m; i++) XtX[i][i] += lambda;
-    const Xty = new Float64Array(m);
-    for (let i = 0; i < m; i++)
-      for (let k = 0; k < n; k++)
-        Xty[i] += X[k][i] * y[k];
-    return gaussianElimination(XtX, Xty);
+  function perfNow() {
+    return global.performance && typeof global.performance.now === 'function'
+      ? global.performance.now()
+      : Date.now();
   }
 
-  function gaussianElimination(A, b) {
-    const n = b.length;
-    const M = A.map((row, i) => [...row, b[i]]);
-    for (let col = 0; col < n; col++) {
-      let maxRow = col;
-      for (let row = col + 1; row < n; row++)
-        if (Math.abs(M[row][col]) > Math.abs(M[maxRow][col])) maxRow = row;
-      [M[col], M[maxRow]] = [M[maxRow], M[col]];
-      if (Math.abs(M[col][col]) < 1e-12) continue;
-      for (let row = 0; row < n; row++) {
-        if (row === col) continue;
-        const factor = M[row][col] / M[col][col];
-        for (let k = col; k <= n; k++) M[row][k] -= factor * M[col][k];
-      }
-    }
-    return M.map((row, i) => (Math.abs(M[i][i]) < 1e-12 ? 0 : row[n] / M[i][i]));
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+  function finite(v, fallback) { return Number.isFinite(v) ? v : fallback; }
+  function viewportWidth() { return finite(global.innerWidth, 0); }
+  function viewportHeight() { return finite(global.innerHeight, 0); }
+  function devicePixelRatio() { return finite(global.devicePixelRatio, 1) || 1; }
+
+  function dispatch(target, name, detail) {
+    if (!target || typeof target.dispatchEvent !== 'function' || typeof global.CustomEvent === 'undefined') return;
+    try { target.dispatchEvent(new global.CustomEvent(name, { detail, bubbles: true })); } catch (_) {}
   }
 
-  // ─── CLAHE (Contrast Limited Adaptive Histogram Equalisation) ─────────────
-
-  /**
-   * Simplified CLAHE on a flat greyscale array.
-   * Divides the patch into a grid of tiles, equalises each tile's histogram
-   * with a clip limit to prevent noise amplification, then bilinearly
-   * interpolates across tile borders.
-   *
-   * For typical eye patches (60×40) we use a 4×4 tile grid (15×10 tiles).
-   * clip = 4.0 is a reasonable default for moderate enhancement.
-   */
-  function clahe(grey, width, height, tileW, tileH, clip) {
-    tileW = tileW || 15;
-    tileH = tileH || 10;
-    clip  = clip  || 4.0;
-
-    const numTX = Math.ceil(width  / tileW);
-    const numTY = Math.ceil(height / tileH);
-    const out   = new Float32Array(grey.length);
-
-    // Build per-tile CDFs
-    const cdfs = [];
-    for (let ty = 0; ty < numTY; ty++) {
-      cdfs[ty] = [];
-      for (let tx = 0; tx < numTX; tx++) {
-        const hist = new Float32Array(256);
-        let count = 0;
-        const x0 = tx * tileW, y0 = ty * tileH;
-        const x1 = Math.min(x0 + tileW, width);
-        const y1 = Math.min(y0 + tileH, height);
-        for (let y = y0; y < y1; y++)
-          for (let x = x0; x < x1; x++) {
-            hist[Math.min(255, Math.floor(grey[y * width + x]))]++;
-            count++;
-          }
-        // Clip histogram
-        const clipCount = clip * count / 256;
-        let excess = 0;
-        for (let b = 0; b < 256; b++) {
-          if (hist[b] > clipCount) { excess += hist[b] - clipCount; hist[b] = clipCount; }
-        }
-        // Redistribute excess uniformly
-        const redist = excess / 256;
-        for (let b = 0; b < 256; b++) hist[b] += redist;
-        // Build CDF
-        const cdf = new Float32Array(256);
-        cdf[0] = hist[0];
-        for (let b = 1; b < 256; b++) cdf[b] = cdf[b - 1] + hist[b];
-        const cdfMin = cdf.find(v => v > 0) || 1;
-        for (let b = 0; b < 256; b++)
-          cdf[b] = Math.round(255 * (cdf[b] - cdfMin) / (count - cdfMin + 1e-6));
-        cdfs[ty][tx] = cdf;
+  function patchPixels(patchLike) {
+    if (!patchLike) return null;
+    const patch = patchLike.patch || patchLike;
+    try {
+      if (patch.data && patch.width && patch.height) {
+        return { data: patch.data, width: patch.width, height: patch.height };
       }
+      if (typeof global.HTMLCanvasElement !== 'undefined' && patch instanceof global.HTMLCanvasElement) {
+        const ctx = patch.getContext('2d', { willReadFrequently: true });
+        const id = ctx.getImageData(0, 0, patch.width, patch.height);
+        return { data: id.data, width: id.width, height: id.height };
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function grayscalePatch(patchLike) {
+    const p = patchPixels(patchLike);
+    if (!p || !p.width || !p.height) return null;
+    const out = new Float32Array(p.width * p.height);
+    if (p.data.length >= out.length * 4) {
+      for (let i = 0, j = 0; j < out.length; i += 4, j++) {
+        out[j] = 0.299 * p.data[i] + 0.587 * p.data[i + 1] + 0.114 * p.data[i + 2];
+      }
+    } else {
+      for (let i = 0; i < out.length; i++) out[i] = finite(p.data[i], 0);
     }
+    return { grey: out, width: p.width, height: p.height };
+  }
 
-    // Bilinear interpolation of tile CDFs
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        const px = grey[y * width + x];
-        const bin = Math.min(255, Math.floor(px));
-
-        // Tile coordinates (fractional)
-        const ftx = (x + 0.5) / tileW - 0.5;
-        const fty = (y + 0.5) / tileH - 0.5;
-        const tx0 = Math.max(0, Math.floor(ftx));
-        const ty0 = Math.max(0, Math.floor(fty));
-        const tx1 = Math.min(numTX - 1, tx0 + 1);
-        const ty1 = Math.min(numTY - 1, ty0 + 1);
-        const fx  = Math.max(0, Math.min(1, ftx - tx0));
-        const fy  = Math.max(0, Math.min(1, fty - ty0));
-
-        const v00 = cdfs[ty0][tx0][bin];
-        const v10 = cdfs[ty0][tx1][bin];
-        const v01 = cdfs[ty1][tx0][bin];
-        const v11 = cdfs[ty1][tx1][bin];
-
-        out[y * width + x] =
-          v00 * (1 - fx) * (1 - fy) +
-          v10 * fx       * (1 - fy) +
-          v01 * (1 - fx) * fy +
-          v11 * fx       * fy;
+  function resizeBilinear(src, sw, sh, dw, dh) {
+    const out = new Float32Array(dw * dh);
+    if (!src || !sw || !sh) return out;
+    for (let y = 0; y < dh; y++) {
+      const sy = ((y + 0.5) * sh / dh) - 0.5;
+      const y0 = clamp(Math.floor(sy), 0, sh - 1);
+      const y1 = clamp(y0 + 1, 0, sh - 1);
+      const fy = clamp(sy - y0, 0, 1);
+      for (let x = 0; x < dw; x++) {
+        const sx = ((x + 0.5) * sw / dw) - 0.5;
+        const x0 = clamp(Math.floor(sx), 0, sw - 1);
+        const x1 = clamp(x0 + 1, 0, sw - 1);
+        const fx = clamp(sx - x0, 0, 1);
+        const a = src[y0 * sw + x0] * (1 - fx) + src[y0 * sw + x1] * fx;
+        const b = src[y1 * sw + x0] * (1 - fx) + src[y1 * sw + x1] * fx;
+        out[y * dw + x] = a * (1 - fy) + b * fy;
       }
     }
     return out;
   }
 
-  // ─── Per-user PCA basis ───────────────────────────────────────────────────
-
-  /**
-   * PCABasis: fitted from actual calibration patches collected during setup.
-   * Falls back to the deterministic random projection until fit() is called.
-   *
-   * Fitting uses the covariance method (mean-centred patches, power iteration
-   * for top-k eigenvectors). Runs once at calibration end in ~5–20ms.
-   */
-  function PCABasis(dim, k, seed) {
-    this.dim    = dim;
-    this.k      = k;
-    this.fitted = false;
-    this.mean   = null;
-    this.basis  = makeFallbackBasis(dim, k, seed);
+  function normalizeContrast(values) {
+    let sum = 0;
+    for (let i = 0; i < values.length; i++) sum += values[i];
+    const mean = sum / Math.max(1, values.length);
+    let ss = 0;
+    for (let i = 0; i < values.length; i++) {
+      const d = values[i] - mean;
+      ss += d * d;
+    }
+    const sd = Math.sqrt(ss / Math.max(1, values.length)) || 1;
+    const out = new Float32Array(values.length);
+    for (let i = 0; i < values.length; i++) out[i] = clamp((values[i] - mean) / (sd * 3), -1, 1);
+    return out;
   }
 
-  PCABasis.prototype = {
-    /**
-     * Fit from an array of raw greyscale arrays (one per calibration patch).
-     * @param {Array<number[]>} patches  Array of grey arrays, each length=dim
-     */
-    fit(patches) {
-      const n = patches.length;
-      if (n < this.k + 2) return false; // not enough data
+  function normalizeEyeFeatures(eyeFeatures) {
+    if (!eyeFeatures || !eyeFeatures.left || !eyeFeatures.right) return null;
+    const l = grayscalePatch(eyeFeatures.left);
+    const r = grayscalePatch(eyeFeatures.right);
+    if (!l || !r) return null;
+    return {
+      left: normalizeContrast(resizeBilinear(l.grey, l.width, l.height, NORM_W, NORM_H)),
+      right: normalizeContrast(resizeBilinear(r.grey, r.width, r.height, NORM_W, NORM_H)),
+    };
+  }
 
-      // Trim patches to expected dim
-      const P = patches.map(p => {
-        const v = new Float64Array(this.dim);
-        const len = Math.min(p.length, this.dim);
-        for (let i = 0; i < len; i++) v[i] = p[i];
-        return v;
-      });
+  function meanBrightness(eyeFeatures) {
+    if (!eyeFeatures || !eyeFeatures.left || !eyeFeatures.right) return null;
+    const l = grayscalePatch(eyeFeatures.left);
+    const r = grayscalePatch(eyeFeatures.right);
+    if (!l || !r) return null;
+    let sum = 0;
+    let count = 0;
+    for (let i = 0; i < l.grey.length; i++) { sum += l.grey[i]; count++; }
+    for (let i = 0; i < r.grey.length; i++) { sum += r.grey[i]; count++; }
+    return count ? sum / count : null;
+  }
 
-      // Mean centre
-      const mean = new Float64Array(this.dim);
-      for (const p of P) for (let i = 0; i < this.dim; i++) mean[i] += p[i] / n;
-      for (const p of P) for (let i = 0; i < this.dim; i++) p[i] -= mean[i];
+  function cloneNormalized(n) {
+    if (!n) return null;
+    return { left: Float32Array.from(n.left), right: Float32Array.from(n.right) };
+  }
 
-      // Power iteration for top-k eigenvectors
-      // Works in the sample space (n×n, not dim×dim) for efficiency
-      // We compute S = P P' / n  (n×n), find its eigenvectors u,
-      // then project back: v = P' u / ||P' u||
+  function serializeNormalized(n) {
+    if (!n) return null;
+    return { left: Array.from(n.left), right: Array.from(n.right) };
+  }
 
-      // Build S = P P' (n×n)
-      const S = Array.from({ length: n }, () => new Float64Array(n));
-      for (let i = 0; i < n; i++)
-        for (let j = i; j < n; j++) {
-          let dot = 0;
-          for (let d = 0; d < this.dim; d++) dot += P[i][d] * P[j][d];
-          dot /= n;
-          S[i][j] = S[j][i] = dot;
-        }
-
-      const basis = [];
-      // Deflation: after each eigenvector, subtract its contribution from S
-      const Scopy = S.map(r => Float64Array.from(r));
-
-      for (let e = 0; e < this.k; e++) {
-        // Random init
-        let u = Float64Array.from({ length: n }, (_, i) => Math.sin(i * 7.3 + e * 3.1));
-        // Power iterate
-        for (let iter = 0; iter < 50; iter++) {
-          const Su = new Float64Array(n);
-          for (let i = 0; i < n; i++)
-            for (let j = 0; j < n; j++) Su[i] += Scopy[i][j] * u[j];
-          const mag = Math.sqrt(Su.reduce((a, v) => a + v * v, 0)) || 1;
-          u = Su.map(v => v / mag);
-        }
-        // Project back to dim space: v = P' u  (dim-dimensional eigenvector)
-        const v = new Float64Array(this.dim);
-        for (let d = 0; d < this.dim; d++)
-          for (let i = 0; i < n; i++) v[d] += P[i][d] * u[i];
-        const vmag = Math.sqrt(v.reduce((a, x) => a + x * x, 0)) || 1;
-        const vn = v.map(x => x / vmag);
-        basis.push(vn);
-
-        // Deflate S: S -= λ u u'   where λ = u' S u
-        let lam = 0;
-        for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) lam += u[i] * Scopy[i][j] * u[j];
-        for (let i = 0; i < n; i++)
-          for (let j = 0; j < n; j++) Scopy[i][j] -= lam * u[i] * u[j];
-      }
-
-      this.mean   = mean;
-      this.basis  = basis.map(v => Array.from(v));
-      this.fitted = true;
-      return true;
-    },
-
-    project(grey) {
-      const len = Math.min(grey.length, this.dim);
-      const v   = new Float64Array(this.dim);
-      for (let i = 0; i < len; i++) v[i] = grey[i];
-      if (this.mean) for (let i = 0; i < this.dim; i++) v[i] -= this.mean[i];
-      return this.basis.map(bv => {
-        let dot = 0;
-        for (let i = 0; i < this.dim; i++) dot += bv[i] * v[i];
-        return dot;
-      });
-    },
-  };
+  function deserializeNormalized(n) {
+    if (!n || !n.left || !n.right) return null;
+    return { left: Float32Array.from(n.left), right: Float32Array.from(n.right) };
+  }
 
   function makeFallbackBasis(dim, k, seed) {
+    let s = seed >>> 0;
     const basis = [];
-    let s = seed;
-    const rand = () => { s = (s * 1664525 + 1013904223) & 0xffffffff; return (s >>> 0) / 0xffffffff - 0.5; };
-    for (let j = 0; j < k; j++) {
-      const v = Array.from({ length: dim }, rand);
-      const mag = Math.sqrt(v.reduce((a, x) => a + x * x, 0)) || 1;
-      basis.push(v.map(x => x / mag));
+    const rand = () => {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      return (s / 0xffffffff) - 0.5;
+    };
+    for (let c = 0; c < k; c++) {
+      const v = new Float64Array(dim);
+      let mag = 0;
+      for (let i = 0; i < dim; i++) { v[i] = rand(); mag += v[i] * v[i]; }
+      mag = Math.sqrt(mag) || 1;
+      for (let i = 0; i < dim; i++) v[i] /= mag;
+      basis.push(Array.from(v));
     }
     return basis;
   }
 
-  // Global per-user PCA bases (one per eye)
-  const LEFT_PCA  = new PCABasis(PATCH_DIM, PATCH_COMPONENTS, 0xdeadbeef);
-  const RIGHT_PCA = new PCABasis(PATCH_DIM, PATCH_COMPONENTS, 0xcafebabe);
-
-  // Storage for raw patches collected during calibration (used to fit PCA)
-  const _calibPatches = { left: [], right: [] };
-
-  // ─── Feature extraction with CLAHE ────────────────────────────────────────
-
-  function getGreyscale(patch) {
-    if (!patch) return null;
-    try {
-      let data, width, height;
-      if (patch instanceof ImageData) {
-        data = patch.data; width = patch.width; height = patch.height;
-      } else if (patch.data && patch.width) {
-        data = patch.data; width = patch.width; height = patch.height;
-      } else if (typeof HTMLCanvasElement !== 'undefined' && patch instanceof HTMLCanvasElement) {
-        const ctx = patch.getContext('2d');
-        const id = ctx.getImageData(0, 0, patch.width, patch.height);
-        data = id.data; width = patch.width; height = patch.height;
-      } else {
-        return null;
-      }
-      const grey = new Float32Array(width * height);
-      for (let i = 0, j = 0; i < data.length; i += 4, j++)
-        grey[j] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-      // Apply CLAHE for contrast normalisation
-      return { grey: clahe(grey, width, height), width, height };
-    } catch (e) { return null; }
+  function PCABasis(dim, k, seed) {
+    this.dim = dim;
+    this.k = k;
+    this.seed = seed >>> 0;
+    this.fitted = false;
+    this.mean = null;
+    this.basis = makeFallbackBasis(dim, k, this.seed);
   }
 
-  function extractFeatures(eyePatches, collectForPCA) {
-    if (!eyePatches || !eyePatches.left || !eyePatches.right) return null;
+  PCABasis.prototype.reset = function () {
+    this.fitted = false;
+    this.mean = null;
+    this.basis = makeFallbackBasis(this.dim, this.k, this.seed);
+  };
 
-    const lResult = getGreyscale(eyePatches.left.patch || eyePatches.left);
-    const rResult = getGreyscale(eyePatches.right.patch || eyePatches.right);
-    if (!lResult || !rResult) return null;
+  PCABasis.prototype.fit = function (patches) {
+    if (!Array.isArray(patches) || patches.length < this.k + 2) return false;
+    const n = patches.length;
+    const P = patches.map(p => {
+      const v = new Float64Array(this.dim);
+      const len = Math.min(this.dim, p.length || 0);
+      for (let i = 0; i < len; i++) v[i] = finite(Number(p[i]), 0);
+      return v;
+    });
+    const mean = new Float64Array(this.dim);
+    for (const p of P) for (let d = 0; d < this.dim; d++) mean[d] += p[d] / n;
+    for (const p of P) for (let d = 0; d < this.dim; d++) p[d] -= mean[d];
 
-    // Optionally stash raw (pre-CLAHE) patches for later PCA fitting
-    if (collectForPCA) {
-      if (_calibPatches.left.length < 300)  _calibPatches.left.push(Array.from(lResult.grey));
-      if (_calibPatches.right.length < 300) _calibPatches.right.push(Array.from(rResult.grey));
+    const S = Array.from({ length: n }, () => new Float64Array(n));
+    for (let i = 0; i < n; i++) {
+      for (let j = i; j < n; j++) {
+        let dot = 0;
+        for (let d = 0; d < this.dim; d++) dot += P[i][d] * P[j][d];
+        S[i][j] = S[j][i] = dot / n;
+      }
     }
+    const M = S.map(row => Float64Array.from(row));
+    const basis = [];
+    for (let e = 0; e < this.k; e++) {
+      let u = Float64Array.from({ length: n }, (_, i) => Math.sin((i + 1) * 1.618 + e * 2.17));
+      for (let iter = 0; iter < 45; iter++) {
+        const next = new Float64Array(n);
+        for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) next[i] += M[i][j] * u[j];
+        let mag = 0;
+        for (let i = 0; i < n; i++) mag += next[i] * next[i];
+        mag = Math.sqrt(mag);
+        if (mag < 1e-12) break;
+        for (let i = 0; i < n; i++) next[i] /= mag;
+        u = next;
+      }
+      const v = new Float64Array(this.dim);
+      let vmag = 0;
+      for (let d = 0; d < this.dim; d++) {
+        let x = 0;
+        for (let i = 0; i < n; i++) x += P[i][d] * u[i];
+        v[d] = x;
+        vmag += x * x;
+      }
+      vmag = Math.sqrt(vmag);
+      if (vmag < 1e-12) {
+        const fallback = makeFallbackBasis(this.dim, 1, this.seed + e * 977)[0];
+        basis.push(fallback);
+        continue;
+      }
+      for (let d = 0; d < this.dim; d++) v[d] /= vmag;
+      basis.push(Array.from(v));
+      let lambda = 0;
+      for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) lambda += u[i] * M[i][j] * u[j];
+      for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) M[i][j] -= lambda * u[i] * u[j];
+    }
+    this.mean = mean;
+    this.basis = basis;
+    this.fitted = true;
+    return true;
+  };
 
-    const lProj = LEFT_PCA.project(lResult.grey);
-    const rProj = RIGHT_PCA.project(rResult.grey);
-    const components = [...lProj, ...rProj];
+  PCABasis.prototype.project = function (values) {
+    const v = values || [];
+    const out = new Array(this.basis.length);
+    for (let b = 0; b < this.basis.length; b++) {
+      const basis = this.basis[b];
+      let dot = 0;
+      for (let i = 0; i < this.dim; i++) {
+        const x = finite(Number(v[i]), 0) - (this.mean ? this.mean[i] : 0);
+        dot += basis[i] * x;
+      }
+      out[b] = dot;
+    }
+    return out;
+  };
 
-    // Degree-2 polynomial features
-    const features = [1.0];
+  const LEFT_PCA = new PCABasis(PATCH_DIM, PCA_COMPONENTS, 0xdeadbeef);
+  const RIGHT_PCA = new PCABasis(PATCH_DIM, PCA_COMPONENTS, 0xcafebabe);
+
+  function featureVector(normalized) {
+    if (!normalized || !normalized.left || !normalized.right) return null;
+    const components = LEFT_PCA.project(normalized.left).concat(RIGHT_PCA.project(normalized.right));
+    const features = [1];
     for (const c of components) features.push(c);
-    for (let i = 0; i < components.length; i++)
-      for (let j = i; j < components.length; j++)
-        features.push(components[i] * components[j]);
-
+    for (let i = 0; i < components.length; i++) {
+      for (let j = i; j < components.length; j++) features.push(components[i] * components[j]);
+    }
     return features;
   }
 
-  // ─── Polynomial Regression ────────────────────────────────────────────────
+  function gaussianSolve(A, b) {
+    const n = b.length;
+    const M = Array.from({ length: n }, (_, i) => {
+      const row = new Float64Array(n + 1);
+      for (let j = 0; j < n; j++) row[j] = finite(Number(A[i][j]), 0);
+      row[n] = finite(Number(b[i]), 0);
+      return row;
+    });
+    for (let col = 0; col < n; col++) {
+      let pivot = col;
+      let max = Math.abs(M[col][col]);
+      for (let r = col + 1; r < n; r++) {
+        const v = Math.abs(M[r][col]);
+        if (v > max) { max = v; pivot = r; }
+      }
+      if (pivot !== col) { const tmp = M[col]; M[col] = M[pivot]; M[pivot] = tmp; }
+      if (Math.abs(M[col][col]) < 1e-10) M[col][col] += 1e-8;
+      const div = M[col][col];
+      if (Math.abs(div) < 1e-14) continue;
+      for (let j = col; j <= n; j++) M[col][j] /= div;
+      for (let r = 0; r < n; r++) {
+        if (r === col) continue;
+        const f = M[r][col];
+        if (!f) continue;
+        for (let j = col; j <= n; j++) M[r][j] -= f * M[col][j];
+      }
+    }
+    return Array.from({ length: n }, (_, i) => finite(M[i][n], 0));
+  }
+
+  function ridgeSolve(X, y, weights, lambda) {
+    if (!X.length) return null;
+    const m = X[0].length;
+    const XtX = Array.from({ length: m }, () => new Float64Array(m));
+    const Xty = new Float64Array(m);
+    for (let k = 0; k < X.length; k++) {
+      const row = X[k];
+      const w = Math.max(1e-8, weights ? finite(weights[k], 1) : 1);
+      for (let i = 0; i < m; i++) {
+        const xi = row[i] * w;
+        Xty[i] += xi * y[k];
+        for (let j = i; j < m; j++) XtX[i][j] += xi * row[j];
+      }
+    }
+    for (let i = 0; i < m; i++) {
+      for (let j = 0; j < i; j++) XtX[i][j] = XtX[j][i];
+      XtX[i][i] += lambda;
+    }
+    return gaussianSolve(XtX, Xty);
+  }
 
   function PolynomialRegression() {
     this.xSamples = [];
     this.ySamples = [];
-    this.weights  = [];
-    this.betaX    = null;
-    this.betaY    = null;
-    this._dirty   = false;
-    this._recentErr = 0; // recent RMSE — used by ensemble
+    this.weights = [];
+    this.sources = [];
+    this.betaX = null;
+    this.betaY = null;
+    this._dirty = false;
+    this.name = 'polynomial';
   }
-
-  PolynomialRegression.prototype = {
-    addData(eyePatches, screenX, screenY, importance) {
-      const feat = extractFeatures(eyePatches, true);
-      if (!feat) return;
-      this.xSamples.push(feat);
-      this.ySamples.push([screenX, screenY]);
-      this.weights.push(importance != null ? importance : 1.0);
-      this._dirty = true;
-      const MAX = 200;
-      if (this.xSamples.length > MAX) { this.xSamples.shift(); this.ySamples.shift(); this.weights.shift(); }
-    },
-    setData(data) {
-      this.xSamples = []; this.ySamples = []; this.weights = [];
-      if (!data) return;
-      for (const d of data)
-        if (d.features && d.screenPos) {
-          this.xSamples.push(d.features); this.ySamples.push(d.screenPos); this.weights.push(d.weight || 1.0);
-        }
-      this._dirty = true;
-    },
-    getData() {
-      return this.xSamples.map((f, i) => ({ features: f, screenPos: this.ySamples[i], weight: this.weights[i] }));
-    },
-    _fit() {
-      const n = this.xSamples.length;
-      if (n < 6) { this.betaX = null; this.betaY = null; return; }
-      const decay = 0.985;
-      const W = this.weights.map((w, i) => w * Math.pow(decay, n - 1 - i));
-      const Xw  = this.xSamples.map((row, i) => row.map(v => v * Math.sqrt(W[i])));
-      const yXw = this.ySamples.map((pos, i) => pos[0] * Math.sqrt(W[i]));
-      const yYw = this.ySamples.map((pos, i) => pos[1] * Math.sqrt(W[i]));
-      this.betaX = ridgeSolve(Xw, yXw, LAMBDA);
-      this.betaY = ridgeSolve(Xw, yYw, LAMBDA);
-      this._dirty = false;
-    },
-    predict(eyePatches) {
-      if (this._dirty) this._fit();
-      if (!this.betaX || !this.betaY) return null;
-      const feat = extractFeatures(eyePatches, false);
-      if (!feat) return null;
-      const dim = Math.min(feat.length, this.betaX.length);
-      let px = 0, py = 0;
-      for (let i = 0; i < dim; i++) { px += feat[i] * this.betaX[i]; py += feat[i] * this.betaY[i]; }
-      return {
-        x: Math.max(0, Math.min(window.innerWidth,  px)),
-        y: Math.max(0, Math.min(window.innerHeight, py)),
-      };
-    },
-    name: 'polynomial',
+  PolynomialRegression.prototype.clear = function () {
+    this.xSamples = []; this.ySamples = []; this.weights = []; this.sources = [];
+    this.betaX = this.betaY = null; this._dirty = false;
   };
-
-  // ─── RBF Regression ───────────────────────────────────────────────────────
+  PolynomialRegression.prototype.addFeatures = function (features, x, y, weight, source) {
+    if (!features) return false;
+    this.xSamples.push(Array.from(features));
+    this.ySamples.push([x, y]);
+    this.weights.push(weight == null ? 1 : weight);
+    this.sources.push(source || 'explicit');
+    if (this.xSamples.length > 300) {
+      this.xSamples.shift(); this.ySamples.shift(); this.weights.shift(); this.sources.shift();
+    }
+    this._dirty = true;
+    return true;
+  };
+  PolynomialRegression.prototype.addNormalized = function (normalized, x, y, weight, source) {
+    return this.addFeatures(featureVector(normalized), x, y, weight, source);
+  };
+  PolynomialRegression.prototype.addData = function (eyeFeatures, x, y, weight) {
+    return this.addNormalized(normalizeEyeFeatures(eyeFeatures), x, y, weight, 'explicit');
+  };
+  PolynomialRegression.prototype.setData = function (data) {
+    this.clear();
+    for (const d of data || []) {
+      if (!d || !d.features || !d.screenPos) continue;
+      this.addFeatures(d.features, d.screenPos[0], d.screenPos[1], d.weight, d.source);
+    }
+  };
+  PolynomialRegression.prototype.getData = function () {
+    return this.xSamples.map((features, i) => ({
+      features: Array.from(features),
+      screenPos: Array.from(this.ySamples[i]),
+      weight: this.weights[i],
+      source: this.sources[i],
+    }));
+  };
+  PolynomialRegression.prototype._fit = function () {
+    if (this.xSamples.length < 6) { this.betaX = this.betaY = null; this._dirty = false; return; }
+    this.betaX = ridgeSolve(this.xSamples, this.ySamples.map(p => p[0]), this.weights, RIDGE_LAMBDA);
+    this.betaY = ridgeSolve(this.xSamples, this.ySamples.map(p => p[1]), this.weights, RIDGE_LAMBDA);
+    this._dirty = false;
+  };
+  PolynomialRegression.prototype.predictNormalized = function (normalized) {
+    if (this._dirty) this._fit();
+    if (!this.betaX || !this.betaY) return null;
+    const f = featureVector(normalized);
+    if (!f) return null;
+    let x = 0, y = 0;
+    const m = Math.min(f.length, this.betaX.length);
+    for (let i = 0; i < m; i++) { x += f[i] * this.betaX[i]; y += f[i] * this.betaY[i]; }
+    return { x: clamp(x, 0, viewportWidth() || x), y: clamp(y, 0, viewportHeight() || y) };
+  };
+  PolynomialRegression.prototype.predict = function (eyeFeatures) {
+    return this.predictNormalized(normalizeEyeFeatures(eyeFeatures));
+  };
 
   function RBFRegression() {
-    this.features   = [];
-    this.targets    = [];
-    this.weights    = [];
-    this.alphaX     = null;
-    this.alphaY     = null;
-    this.gamma      = 1.0;
-    this._dirty     = false;
-    this._recentErr = 0;
+    this.features = [];
+    this.targets = [];
+    this.weights = [];
+    this.sources = [];
+    this.alphaX = null;
+    this.alphaY = null;
+    this.gamma = 1;
+    this._dirty = false;
+    this.name = 'rbf';
   }
-
-  RBFRegression.prototype = {
-    addData(eyePatches, screenX, screenY, importance) {
-      const feat = extractFeatures(eyePatches, false);
-      if (!feat) return;
-      this.features.push(feat);
-      this.targets.push([screenX, screenY]);
-      this.weights.push(importance != null ? importance : 1.0);
-      this._dirty = true;
-      const MAX = 100;
-      if (this.features.length > MAX) { this.features.shift(); this.targets.shift(); this.weights.shift(); }
-    },
-    setData(data) {
-      this.features = []; this.targets = []; this.weights = [];
-      if (!data) return;
-      for (const d of data)
-        if (d.features && d.screenPos) {
-          this.features.push(d.features); this.targets.push(d.screenPos); this.weights.push(d.weight || 1.0);
-        }
-      this._dirty = true;
-    },
-    getData() {
-      return this.features.map((f, i) => ({ features: f, screenPos: this.targets[i], weight: this.weights[i] }));
-    },
-    _sqDist(a, b) {
-      const dim = Math.min(a.length, b.length);
-      let s = 0;
-      for (let i = 0; i < dim; i++) { const d = a[i] - b[i]; s += d * d; }
-      return s;
-    },
-    _tuneGamma() {
-      const n = this.features.length;
-      if (n < 2) return;
-      const dists = [];
-      for (let i = 0; i < n; i++)
-        for (let j = i + 1; j < n; j++) dists.push(this._sqDist(this.features[i], this.features[j]));
-      dists.sort((a, b) => a - b);
-      const median = dists[Math.floor(dists.length / 2)] || 1;
-      this.gamma = 1 / (2 * median);
-    },
-    _fit() {
-      const n = this.features.length;
-      if (n < 4) { this.alphaX = null; this.alphaY = null; return; }
-      this._tuneGamma();
-      const K = Array.from({ length: n }, (_, i) =>
-        Array.from({ length: n }, (__, j) =>
-          Math.exp(-this.gamma * this._sqDist(this.features[i], this.features[j]))
-        )
-      );
-      const decay = 0.98;
-      for (let i = 0; i < n; i++)
-        K[i][i] += LAMBDA / (this.weights[i] * Math.pow(decay, n - 1 - i) + 1e-8);
-      this.alphaX = gaussianElimination(K, this.targets.map(t => t[0]));
-      this.alphaY = gaussianElimination(K, this.targets.map(t => t[1]));
-      this._dirty = false;
-    },
-    predict(eyePatches) {
-      if (this._dirty) this._fit();
-      if (!this.alphaX) return null;
-      const feat = extractFeatures(eyePatches, false);
-      if (!feat) return null;
-      let px = 0, py = 0;
-      for (let i = 0; i < this.features.length; i++) {
-        const k = Math.exp(-this.gamma * this._sqDist(feat, this.features[i]));
-        px += this.alphaX[i] * k; py += this.alphaY[i] * k;
-      }
-      return {
-        x: Math.max(0, Math.min(window.innerWidth,  px)),
-        y: Math.max(0, Math.min(window.innerHeight, py)),
-      };
-    },
-    name: 'rbf',
+  RBFRegression.prototype.clear = function () {
+    this.features = []; this.targets = []; this.weights = []; this.sources = [];
+    this.alphaX = this.alphaY = null; this._dirty = false;
+  };
+  RBFRegression.prototype._sqDist = function (a, b) {
+    let s = 0;
+    const m = Math.min(a.length, b.length);
+    for (let i = 0; i < m; i++) { const d = a[i] - b[i]; s += d * d; }
+    return s;
+  };
+  RBFRegression.prototype.addFeatures = function (features, x, y, weight, source) {
+    if (!features) return false;
+    this.features.push(Array.from(features));
+    this.targets.push([x, y]);
+    this.weights.push(weight == null ? 1 : weight);
+    this.sources.push(source || 'explicit');
+    if (this.features.length > 120) {
+      this.features.shift(); this.targets.shift(); this.weights.shift(); this.sources.shift();
+    }
+    this._dirty = true;
+    return true;
+  };
+  RBFRegression.prototype.addNormalized = function (normalized, x, y, weight, source) {
+    return this.addFeatures(featureVector(normalized), x, y, weight, source);
+  };
+  RBFRegression.prototype.addData = function (eyeFeatures, x, y, weight) {
+    return this.addNormalized(normalizeEyeFeatures(eyeFeatures), x, y, weight, 'explicit');
+  };
+  RBFRegression.prototype.setData = function (data) {
+    this.clear();
+    for (const d of data || []) {
+      if (!d || !d.features || !d.screenPos) continue;
+      this.addFeatures(d.features, d.screenPos[0], d.screenPos[1], d.weight, d.source);
+    }
+  };
+  RBFRegression.prototype.getData = function () {
+    return this.features.map((features, i) => ({
+      features: Array.from(features), screenPos: Array.from(this.targets[i]),
+      weight: this.weights[i], source: this.sources[i],
+    }));
+  };
+  RBFRegression.prototype._fit = function () {
+    const n = this.features.length;
+    if (n < 4) { this.alphaX = this.alphaY = null; this._dirty = false; return; }
+    const dists = [];
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) dists.push(this._sqDist(this.features[i], this.features[j]));
+    dists.sort((a, b) => a - b);
+    const median = dists[Math.floor(dists.length / 2)] || 1;
+    this.gamma = 1 / (2 * median + 1e-12);
+    const K = Array.from({ length: n }, () => new Float64Array(n));
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < n; j++) K[i][j] = Math.exp(-this.gamma * this._sqDist(this.features[i], this.features[j]));
+      K[i][i] += RIDGE_LAMBDA / Math.max(0.05, this.weights[i]);
+    }
+    this.alphaX = gaussianSolve(K, this.targets.map(t => t[0]));
+    this.alphaY = gaussianSolve(K, this.targets.map(t => t[1]));
+    this._dirty = false;
+  };
+  RBFRegression.prototype.predictNormalized = function (normalized) {
+    if (this._dirty) this._fit();
+    if (!this.alphaX) return null;
+    const f = featureVector(normalized);
+    if (!f) return null;
+    let x = 0, y = 0;
+    for (let i = 0; i < this.features.length; i++) {
+      const k = Math.exp(-this.gamma * this._sqDist(f, this.features[i]));
+      x += this.alphaX[i] * k;
+      y += this.alphaY[i] * k;
+    }
+    return { x: clamp(x, 0, viewportWidth() || x), y: clamp(y, 0, viewportHeight() || y) };
+  };
+  RBFRegression.prototype.predict = function (eyeFeatures) {
+    return this.predictNormalized(normalizeEyeFeatures(eyeFeatures));
   };
 
-  // ─── Ensemble regression ──────────────────────────────────────────────────
-
-  /**
-   * Blends polynomial and RBF predictions weighted by their rolling RMSE.
-   * The model with lower recent error gets more weight.
-   * Falls back to whichever model is ready if only one has enough data.
-   */
   function EnsembleRegression(poly, rbf) {
-    this.poly = poly;
-    this.rbf  = rbf;
+    this.poly = poly || new PolynomialRegression();
+    this.rbf = rbf || new RBFRegression();
     this._errPoly = 0;
-    this._errRbf  = 0;
-    this._alpha   = 0.05; // EMA for error tracking
+    this._errRbf = 0;
+    this._alpha = 0.08;
     this.name = 'ensemble';
   }
-
-  EnsembleRegression.prototype = {
-    addData(eyePatches, screenX, screenY, importance) {
-      this.poly.addData(eyePatches, screenX, screenY, importance);
-      this.rbf.addData(eyePatches, screenX, screenY, importance);
-    },
-    setData(data) { this.poly.setData(data); this.rbf.setData(data); },
-    getData()     { return this.poly.getData(); },
-
-    predict(eyePatches) {
-      const pPoly = this.poly.predict(eyePatches);
-      const pRbf  = this.rbf.predict(eyePatches);
-
-      if (!pPoly && !pRbf) return null;
-      if (!pPoly) return pRbf;
-      if (!pRbf)  return pPoly;
-
-      // Weight inversely by recent error
-      const errPoly = this._errPoly || 1;
-      const errRbf  = this._errRbf  || 1;
-      const wPoly = 1 / errPoly;
-      const wRbf  = 1 / errRbf;
-      const wSum  = wPoly + wRbf;
-
-      return {
-        x: (pPoly.x * wPoly + pRbf.x * wRbf) / wSum,
-        y: (pPoly.y * wPoly + pRbf.y * wRbf) / wSum,
-      };
-    },
-
-    /** Call after each confirmed calibration point to track model accuracy */
-    trackError(eyePatches, trueX, trueY) {
-      const pp = this.poly.predict(eyePatches);
-      const pr = this.rbf.predict(eyePatches);
-      if (pp) {
-        const err = Math.sqrt((pp.x - trueX) ** 2 + (pp.y - trueY) ** 2);
-        this._errPoly = this._errPoly * (1 - this._alpha) + err * this._alpha;
-      }
-      if (pr) {
-        const err = Math.sqrt((pr.x - trueX) ** 2 + (pr.y - trueY) ** 2);
-        this._errRbf  = this._errRbf  * (1 - this._alpha) + err * this._alpha;
-      }
-    },
+  EnsembleRegression.prototype.clear = function () { this.poly.clear(); this.rbf.clear(); this._errPoly = this._errRbf = 0; };
+  EnsembleRegression.prototype.addNormalized = function (n, x, y, w, source) {
+    this.poly.addNormalized(n, x, y, w, source);
+    this.rbf.addNormalized(n, x, y, w, source);
+    return true;
+  };
+  EnsembleRegression.prototype.addData = function (eyeFeatures, x, y, w) {
+    const n = normalizeEyeFeatures(eyeFeatures);
+    return n ? this.addNormalized(n, x, y, w, 'explicit') : false;
+  };
+  EnsembleRegression.prototype.setData = function (data) { this.poly.setData(data); this.rbf.setData(data); };
+  EnsembleRegression.prototype.getData = function () { return this.poly.getData(); };
+  EnsembleRegression.prototype.predictNormalized = function (n) {
+    const p = this.poly.predictNormalized(n);
+    const r = this.rbf.predictNormalized(n);
+    if (!p && !r) return null;
+    if (!p) return r;
+    if (!r) return p;
+    const ep = this._errPoly > 0 ? this._errPoly : 1;
+    const er = this._errRbf > 0 ? this._errRbf : 1;
+    const wp = 1 / ep, wr = 1 / er, sum = wp + wr;
+    return { x: (p.x * wp + r.x * wr) / sum, y: (p.y * wp + r.y * wr) / sum };
+  };
+  EnsembleRegression.prototype.predict = function (eyeFeatures) {
+    return this.predictNormalized(normalizeEyeFeatures(eyeFeatures));
+  };
+  EnsembleRegression.prototype.trackErrorNormalized = function (n, x, y) {
+    const p = this.poly.predictNormalized(n);
+    const r = this.rbf.predictNormalized(n);
+    if (p) {
+      const e = Math.hypot(p.x - x, p.y - y);
+      this._errPoly = this._errPoly ? this._errPoly * (1 - this._alpha) + e * this._alpha : e;
+    }
+    if (r) {
+      const e = Math.hypot(r.x - x, r.y - y);
+      this._errRbf = this._errRbf ? this._errRbf * (1 - this._alpha) + e * this._alpha : e;
+    }
+  };
+  EnsembleRegression.prototype.trackError = function (eyeFeatures, x, y) {
+    const n = normalizeEyeFeatures(eyeFeatures);
+    if (n) this.trackErrorNormalized(n, x, y);
   };
 
-  // ─── Kalman filter ────────────────────────────────────────────────────────
-
-  /**
-   * 4-state Kalman filter: [x, y, vx, vy]
-   *
-   * Process model: constant velocity with Gaussian process noise Q
-   * Measurement model: we observe [x, y] directly (H = [I | 0])
-   *
-   * This separates process noise (head/body movement) from measurement
-   * noise (frame-to-frame jitter in the regression output). The result
-   * is much smoother than EMA without introducing the lag EMA causes
-   * during genuine gaze shifts.
-   *
-   * Tune via:
-   *   processNoise     — larger = trust measurements more (more responsive)
-   *   measurementNoise — larger = trust model more (smoother but laggier)
-   */
   function KalmanFilter(options) {
     options = options || {};
-    this.Q = options.processNoise     || 8;    // process noise variance
-    this.R = options.measurementNoise || 50;   // measurement noise variance
-
-    // State: [x, y, vx, vy]
-    this.x = null; // null = not initialised
-    // Error covariance (4×4, stored as flat 16-element array, row-major)
-    this.P = [
-      1000, 0, 0, 0,
-      0, 1000, 0, 0,
-      0, 0, 100, 0,
-      0, 0, 0, 100,
-    ];
-    this.lastT  = null;
-    this._blink = false;
+    this.Q = options.processNoise == null ? 8 : options.processNoise;
+    this.R = options.measurementNoise == null ? 50 : options.measurementNoise;
+    this.reset();
   }
-
-  KalmanFilter.prototype = {
-
-    _matMul4x4(A, B) {
-      const C = new Float64Array(16);
-      for (let i = 0; i < 4; i++)
-        for (let j = 0; j < 4; j++)
-          for (let k = 0; k < 4; k++)
-            C[i * 4 + j] += A[i * 4 + k] * B[k * 4 + j];
-      return C;
-    },
-
-    /** Predict step — project state forward by dt milliseconds */
-    _predict(dt) {
-      const s = dt / 1000; // seconds
-      // F = [[1,0,s,0],[0,1,0,s],[0,0,1,0],[0,0,0,1]]
-      const nx = this.x[0] + this.x[2] * s;
-      const ny = this.x[1] + this.x[3] * s;
-      this.x = [nx, ny, this.x[2], this.x[3]];
-
-      // P = F P F' + Q·I  (simplified: only add Q to diagonal)
-      const F = [
-        1, 0, s, 0,
-        0, 1, 0, s,
-        0, 0, 1, 0,
-        0, 0, 0, 1,
-      ];
-      const Ft = [
-        1, 0, 0, 0,
-        0, 1, 0, 0,
-        s, 0, 1, 0,
-        0, s, 0, 1,
-      ];
-      const FP   = this._matMul4x4(F, this.P);
-      const FPFt = this._matMul4x4(FP, Ft);
-      const Q    = this.Q;
-      this.P = FPFt;
-      this.P[0]  += Q;
-      this.P[5]  += Q;
-      this.P[10] += Q * 0.1;
-      this.P[15] += Q * 0.1;
-    },
-
-    /** Update step — incorporate measurement [mx, my] */
-    _update(mx, my) {
-      // H = [[1,0,0,0],[0,1,0,0]] (we only observe x,y)
-      // S = H P H' + R·I  (2×2)
-      const S00 = this.P[0]  + this.R;
-      const S01 = this.P[1];
-      const S10 = this.P[4];
-      const S11 = this.P[5] + this.R;
-
-      // K = P H' S⁻¹  (4×2)
-      const det = S00 * S11 - S01 * S10 + 1e-10;
-      const Si00 =  S11 / det, Si01 = -S01 / det;
-      const Si10 = -S10 / det, Si11 =  S00 / det;
-
-      // P H' (4×2)
-      const PH = [
-        this.P[0],  this.P[1],
-        this.P[4],  this.P[5],
-        this.P[8],  this.P[9],
-        this.P[12], this.P[13],
-      ];
-
-      const K = [
-        PH[0] * Si00 + PH[1] * Si10,   PH[0] * Si01 + PH[1] * Si11,
-        PH[2] * Si00 + PH[3] * Si10,   PH[2] * Si01 + PH[3] * Si11,
-        PH[4] * Si00 + PH[5] * Si10,   PH[4] * Si01 + PH[5] * Si11,
-        PH[6] * Si00 + PH[7] * Si10,   PH[6] * Si01 + PH[7] * Si11,
-      ];
-
-      // Innovation
-      const innX = mx - this.x[0];
-      const innY = my - this.x[1];
-
-      // State update
-      this.x[0] += K[0] * innX + K[1] * innY;
-      this.x[1] += K[2] * innX + K[3] * innY;
-      this.x[2] += K[4] * innX + K[5] * innY;
-      this.x[3] += K[6] * innX + K[7] * innY;
-
-      // P = (I - K H) P  (simplified Joseph form for 4×4)
-      const KH = [
-        K[0], K[1], 0, 0,
-        K[2], K[3], 0, 0,
-        K[4], K[5], 0, 0,
-        K[6], K[7], 0, 0,
-      ];
-      const IKH = [
-        1 - KH[0],  -KH[1],  0, 0,
-         -KH[4], 1 - KH[5], 0, 0,
-         -KH[8],  -KH[9],   1, 0,
-        -KH[12], -KH[13],   0, 1,
-      ];
-      this.P = this._matMul4x4(IKH, this.P);
-    },
-
-    smooth(x, y, isBlink, isSaccade) {
-      const now = performance.now();
-
-      if (this.x === null) {
-        this.x = [x, y, 0, 0];
-        this.lastT = now;
-        return { x, y, vx: 0, vy: 0, confidence: 0 };
-      }
-
-      const dt = Math.min(now - this.lastT, 120);
+  KalmanFilter.prototype.reset = function () {
+    this.x = null;
+    this.P = [1000,0,0,0, 0,1000,0,0, 0,0,100,0, 0,0,0,100];
+    this.lastT = null;
+  };
+  KalmanFilter.prototype._mul4 = function (A, B) {
+    const C = new Array(16).fill(0);
+    for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) for (let k = 0; k < 4; k++) C[r*4+c] += A[r*4+k] * B[k*4+c];
+    return C;
+  };
+  KalmanFilter.prototype._predict = function (dtMs) {
+    const s = dtMs / 1000;
+    this.x[0] += this.x[2] * s;
+    this.x[1] += this.x[3] * s;
+    const F = [1,0,s,0, 0,1,0,s, 0,0,1,0, 0,0,0,1];
+    const Ft = [1,0,0,0, 0,1,0,0, s,0,1,0, 0,s,0,1];
+    this.P = this._mul4(this._mul4(F, this.P), Ft);
+    this.P[0] += this.Q; this.P[5] += this.Q; this.P[10] += this.Q * 0.1; this.P[15] += this.Q * 0.1;
+  };
+  KalmanFilter.prototype._update = function (mx, my) {
+    const S00 = this.P[0] + this.R, S01 = this.P[1], S10 = this.P[4], S11 = this.P[5] + this.R;
+    const det = S00 * S11 - S01 * S10;
+    if (Math.abs(det) < 1e-12) return;
+    const i00 = S11 / det, i01 = -S01 / det, i10 = -S10 / det, i11 = S00 / det;
+    const PH = [this.P[0],this.P[1], this.P[4],this.P[5], this.P[8],this.P[9], this.P[12],this.P[13]];
+    const K = new Array(8);
+    for (let r = 0; r < 4; r++) {
+      K[r*2] = PH[r*2] * i00 + PH[r*2+1] * i10;
+      K[r*2+1] = PH[r*2] * i01 + PH[r*2+1] * i11;
+    }
+    const dx = mx - this.x[0], dy = my - this.x[1];
+    for (let r = 0; r < 4; r++) this.x[r] += K[r*2] * dx + K[r*2+1] * dy;
+    const I_KH = [
+      1-K[0], -K[1], 0, 0,
+      -K[2], 1-K[3], 0, 0,
+      -K[4], -K[5], 1, 0,
+      -K[6], -K[7], 0, 1,
+    ];
+    this.P = this._mul4(I_KH, this.P);
+  };
+  KalmanFilter.prototype.smooth = function (mx, my, suppressMeasurement) {
+    const now = perfNow();
+    if (!this.x) {
+      this.x = [mx, my, 0, 0];
       this.lastT = now;
-
-      this._predict(dt);
-
-      // During blinks or saccades: skip measurement update, coast on prediction
-      if (!isBlink && !isSaccade) {
-        this._update(x, y);
-      }
-
-      const vMag = Math.sqrt(this.x[2] ** 2 + this.x[3] ** 2);
-      // Confidence: falls with velocity and with large innovation
-      const innovation = Math.sqrt((x - this.x[0]) ** 2 + (y - this.x[1]) ** 2);
-      const confidence = Math.max(0, Math.min(1,
-        (1 - vMag / 800) * (1 - innovation / 300)
-      ));
-
-      return {
-        x:          this.x[0],
-        y:          this.x[1],
-        vx:         this.x[2],
-        vy:         this.x[3],
-        confidence,
-        isBlink,
-        isSaccade,
-      };
-    },
-
-    reset() {
-      this.x = null;
-      this.P = [1000,0,0,0, 0,1000,0,0, 0,0,100,0, 0,0,0,100];
-      this.lastT = null;
-    },
+      return { x: mx, y: my, vx: 0, vy: 0, innovation: 0, stability: 0.5 };
+    }
+    const dt = clamp(now - this.lastT, 1, 120);
+    this.lastT = now;
+    this._predict(dt);
+    const innovationBefore = Math.hypot(mx - this.x[0], my - this.x[1]);
+    if (!suppressMeasurement) this._update(mx, my);
+    const speed = Math.hypot(this.x[2], this.x[3]);
+    const stability = clamp((1 - speed / 900) * (1 - innovationBefore / 350), 0, 1);
+    return { x: this.x[0], y: this.x[1], vx: this.x[2], vy: this.x[3], innovation: innovationBefore, stability };
   };
 
-  // ─── Blink detector ───────────────────────────────────────────────────────
-
-  /**
-   * Detects blinks by measuring patch brightness.
-   * During a blink the eye patch goes dark (eyelid covers pupil).
-   * Uses an adaptive threshold based on recent patch brightness history.
-   *
-   * Returns true while a blink is in progress.
-   * Has a ~80ms post-blink lockout to prevent jitter as the eye reopens.
-   */
   function BlinkDetector(options) {
     options = options || {};
-    this.windowSize   = options.windowSize   || 30;  // frames of history
-    this.blinkThresh  = options.blinkThresh  || 0.55; // fraction of mean to trigger
-    this.lockoutMs    = options.lockoutMs    || 80;
-
-    this._history     = [];
-    this._blinking    = false;
-    this._lockoutEnd  = 0;
+    this.windowSize = options.windowSize == null ? 30 : options.windowSize;
+    this.threshold = options.threshold == null ? 0.55 : options.threshold;
+    this.lockoutMs = options.lockoutMs == null ? 80 : options.lockoutMs;
+    this.history = [];
+    this.lockoutEnd = 0;
   }
-
-  BlinkDetector.prototype.update = function (eyePatches) {
-    if (!eyePatches || !eyePatches.left) return this._blinking;
-
-    // Get mean brightness of left eye patch (quick proxy for both eyes)
-    const patch = eyePatches.left.patch || eyePatches.left;
-    let brightness = 0, count = 0;
-    try {
-      let data;
-      if (patch instanceof ImageData)                                          data = patch.data;
-      else if (patch.data)                                                     data = patch.data;
-      else if (typeof HTMLCanvasElement !== 'undefined' && patch instanceof HTMLCanvasElement)
-        data = patch.getContext('2d').getImageData(0,0,patch.width,patch.height).data;
-      if (data) {
-        for (let i = 0; i < data.length; i += 4) {
-          brightness += 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
-          count++;
-        }
-        brightness /= count || 1;
-      }
-    } catch (e) { return this._blinking; }
-
-    this._history.push(brightness);
-    if (this._history.length > this.windowSize) this._history.shift();
-
-    const mean = this._history.reduce((a, v) => a + v, 0) / this._history.length;
-    const now  = performance.now();
-
-    if (now < this._lockoutEnd) return true; // post-blink lockout
-
-    const isBlink = brightness < mean * this.blinkThresh;
-
-    if (isBlink && !this._blinking) {
-      this._blinking   = true;
-      this._lockoutEnd = 0;
-    } else if (!isBlink && this._blinking) {
-      this._blinking   = false;
-      this._lockoutEnd = now + this.lockoutMs;
+  BlinkDetector.prototype.reset = function () { this.history = []; this.lockoutEnd = 0; };
+  BlinkDetector.prototype.update = function (eyeFeatures) {
+    const b = meanBrightness(eyeFeatures);
+    if (b == null) return false;
+    const now = perfNow();
+    if (now < this.lockoutEnd) return true;
+    const baseline = this.history.length
+      ? this.history.reduce((a, v) => a + v, 0) / this.history.length
+      : b;
+    const blink = this.history.length >= 5 && b < baseline * this.threshold;
+    if (!blink) {
+      this.history.push(b);
+      if (this.history.length > this.windowSize) this.history.shift();
+    } else {
+      this.lockoutEnd = now + this.lockoutMs;
     }
-
-    return this._blinking || now < this._lockoutEnd;
+    return blink;
   };
 
-  // ─── Saccade detector ────────────────────────────────────────────────────
+  function SaccadeDetector(threshold) { this.threshold = threshold == null ? 600 : threshold; }
+  SaccadeDetector.prototype.isSaccade = function (vx, vy) { return Math.hypot(vx || 0, vy || 0) > this.threshold; };
 
-  /**
-   * Detects saccades (fast eye movements) from the Kalman velocity estimate.
-   * During a saccade the regression output is unreliable — we coast on
-   * the Kalman prediction instead of incorporating the noisy measurement.
-   *
-   * threshold: px/sec above which we suppress the measurement update
-   */
-  function SaccadeDetector(threshold) {
-    this.threshold = threshold || 600; // px/sec
-  }
-
-  SaccadeDetector.prototype.isSaccade = function (vx, vy) {
-    return Math.sqrt(vx * vx + vy * vy) > this.threshold;
-  };
-
-  // ─── Frame cache ──────────────────────────────────────────────────────────
-
-  /**
-   * Skips regression inference when gaze appears stable.
-   * If velocity is below `minSpeed` px/sec, reuse the last prediction
-   * for up to `maxReuseMs` milliseconds. Saves ~20–40% CPU on fast devices,
-   * more on slow ones.
-   */
-  function FrameCache(options) {
+  function DriftWatchdog(owner, options) {
     options = options || {};
-    this.minSpeed  = options.minSpeed  || 15;  // px/sec
-    this.maxReuseMs = options.maxReuseMs || 50; // max ms to reuse
-
-    this._last  = null;
-    this._lastT = 0;
+    this.owner = owner || null;
+    this.warnThreshold = options.warnThreshold == null ? 120 : options.warnThreshold;
+    this.critThreshold = options.critThreshold == null ? 220 : options.critThreshold;
+    this.minEvidence = options.minEvidence == null ? 5 : options.minEvidence;
+    this.decay = options.decay == null ? 0.88 : options.decay;
+    this.onWarn = options.onWarn || null;
+    this.onCritical = options.onCritical || null;
+    this.enabled = false;
+    this.reset();
   }
-
-  FrameCache.prototype = {
-    shouldSkip(vx, vy) {
-      if (!this._last) return false;
-      const speed = Math.sqrt(vx * vx + vy * vy);
-      const age   = performance.now() - this._lastT;
-      return speed < this.minSpeed && age < this.maxReuseMs;
-    },
-    store(pred) {
-      this._last  = pred;
-      this._lastT = performance.now();
-    },
-    get() { return this._last; },
+  DriftWatchdog.prototype.enable = function () { this.enabled = true; return this; };
+  DriftWatchdog.prototype.disable = function () { this.enabled = false; return this; };
+  DriftWatchdog.prototype.reset = function () { this.weightedSS = 0; this.weightSum = 0; this.rmse = 0; this.state = 'ok'; };
+  DriftWatchdog.prototype.record = function (normalized, x, y, evidenceWeight) {
+    if (!this.enabled || !this.owner || !normalized) return null;
+    const pred = this.owner._predictRegression(normalized);
+    if (!pred) return null;
+    const w = clamp(evidenceWeight == null ? 1 : evidenceWeight, 0.01, 1);
+    const residual = Math.hypot(pred.x - x, pred.y - y);
+    this.weightedSS = this.weightedSS * this.decay + residual * residual * w;
+    this.weightSum = this.weightSum * this.decay + w;
+    this.rmse = this.weightSum >= this.minEvidence ? Math.sqrt(this.weightedSS / this.weightSum) : 0;
+    const previous = this.state;
+    if (this.rmse >= this.critThreshold) this.state = 'critical';
+    else if (this.rmse >= this.warnThreshold) this.state = 'warning';
+    else if (this.rmse < this.warnThreshold * 0.8) this.state = 'ok';
+    if (this.state !== previous && this.state !== 'ok') {
+      const detail = { rmse: Math.round(this.rmse), state: this.state, evidence: this.weightSum, timestamp: Date.now() };
+      const doc = global.document;
+      dispatch(doc, this.state === 'critical' ? 'webgazer-aac:drift-critical' : 'webgazer-aac:drift-warning', detail);
+      const cb = this.state === 'critical' ? this.onCritical : this.onWarn;
+      if (typeof cb === 'function') try { cb(detail); } catch (_) {}
+    }
+    return residual;
   };
 
-  // ─── Confidence-gated dwell timer ────────────────────────────────────────
-
-  /**
-   * DwellTimer — tracks gaze fixation on DOM elements and fires completion
-   * events only when confidence is high enough to trust the fixation.
-   *
-   * Design:
-   *   • Each call to update() passes the current gaze point, confidence,
-   *     isSaccade, and isBlink flags from the gaze listener output.
-   *   • Progress [0→1] advances at (dt / dwellMs) per frame while the gaze
-   *     is inside the target element's bounding rect AND confidence ≥ minConfidence.
-   *   • Progress freezes (does not reset) when:
-   *       - confidence drops below minConfidence
-   *       - isSaccade is true
-   *       - isBlink is true (gaze listener already passes null during blinks;
-   *         this handles the case where the caller passes isBlink explicitly)
-   *   • Progress resets to 0 when gaze leaves the element's bounding rect.
-   *   • On completion the timer fires 'webgazer-aac:dwell-complete' on the
-   *     target element AND calls webgazerAAC.recordDwellHitXY() automatically
-   *     so the drift watchdog and adaptive recalibrator both receive the signal.
-   *
-   * Events fired on the target element (all bubble):
-   *   webgazer-aac:dwell-progress  — {progress, confidence, x, y}   each frame
-   *   webgazer-aac:dwell-complete  — {x, y}                          on 100%
-   *   webgazer-aac:dwell-cancel    — {reason}                        on leave
-   *
-   * Constructor options:
-   *   dwellMs        {number}  — ms to complete a dwell (default 800)
-   *   minConfidence  {number}  — 0–1 Kalman confidence gate (default 0.25)
-   *   holdAfterMs    {number}  — ms to freeze timer after completion before
-   *                              it can fire again on the same element (default 1200)
-   *   aacRef         {object}  — webgazerAAC reference for recordDwellHitXY
-   *                              (set automatically by webgazerAAC.createDwellTimer)
-   */
-  function DwellTimer(options) {
-    options = options || {};
-    this.dwellMs       = options.dwellMs       || 800;
-    this.minConfidence = options.minConfidence || 0.25;
-    this.holdAfterMs   = options.holdAfterMs   || 1200;
-    this._aacRef       = options.aacRef        || null;
-
-    this._target     = null;   // current DOM element being dwelled on
-    this._progress   = 0;      // 0–1
-    this._lastT      = null;
-    this._holdUntil  = 0;      // timestamp: freeze re-fire after completion
-  }
-
-  DwellTimer.prototype = {
-
-    /**
-     * Call this from your setGazeListener callback every frame.
-     *
-     * @param {Element|null} element     — element under the gaze point (or null)
-     * @param {number}       x           — gaze X from listener
-     * @param {number}       y           — gaze Y from listener
-     * @param {number}       confidence  — from listener result (0–1)
-     * @param {boolean}      isSaccade   — from listener result
-     * @param {boolean}      [isBlink]   — optional; listener already returns null
-     *                                     during blinks, but pass true if you track it
-     * @returns {number} current progress 0–1
-     */
-    update(element, x, y, confidence, isSaccade, isBlink) {
-      const now = performance.now();
-
-      // Null gaze (blink) — freeze progress, don't reset
-      if (element === null || isBlink) {
-        this._lastT = now;
-        return this._progress;
-      }
-
-      // Element changed — cancel previous dwell
-      if (element !== this._target) {
-        if (this._target !== null && this._progress > 0) {
-          this._fireEvent(this._target, 'webgazer-aac:dwell-cancel',
-            { reason: 'gaze-left', x, y });
-        }
-        this._target   = element;
-        this._progress = 0;
-        this._lastT    = now;
-        return 0;
-      }
-
-      const dt = this._lastT !== null ? Math.min(now - this._lastT, 100) : 0;
-      this._lastT = now;
-
-      // Freeze conditions — progress holds, does not advance or reset
-      const frozen = isSaccade ||
-                     confidence < this.minConfidence ||
-                     now < this._holdUntil;
-
-      if (!frozen) {
-        this._progress = Math.min(1, this._progress + dt / this.dwellMs);
-      }
-
-      // Fire progress event
-      this._fireEvent(element, 'webgazer-aac:dwell-progress', {
-        progress:   this._progress,
-        confidence,
-        x, y,
-        frozen,
-      });
-
-      // Completion
-      if (this._progress >= 1 && now >= this._holdUntil) {
-        this._holdUntil = now + this.holdAfterMs;
-        this._progress  = 0;
-        this._fireEvent(element, 'webgazer-aac:dwell-complete', { x, y });
-        // Feed drift watchdog + adaptive recalibrator
-        if (this._aacRef) {
-          try { this._aacRef.recordDwellHitXY(x, y); } catch (e) {}
-        }
-      }
-
-      return this._progress;
-    },
-
-    /** Manually reset progress (e.g. after a re-calibration or page nav). */
-    reset() {
-      this._target    = null;
-      this._progress  = 0;
-      this._lastT     = null;
-      this._holdUntil = 0;
-    },
-
-    /** Current progress 0–1. */
-    get progress() { return this._progress; },
-
-    _fireEvent(target, name, detail) {
-      try {
-        if (typeof CustomEvent !== 'undefined') {
-          target.dispatchEvent(new CustomEvent(name, { detail, bubbles: true }));
-        }
-      } catch (e) {}
-    },
-  };
-
-  // ─── Drift watchdog ───────────────────────────────────────────────────────
-
-  /**
-   * DriftWatchdog — detects when the regression model has silently gone stale.
-   *
-   * Strategy:
-   *   Every time a ground-truth gaze position is confirmed (calibration click,
-   *   dwell hit, or explicit recordScreenPosition call) we compare it against
-   *   the current regression prediction and record the Euclidean residual.
-   *
-   *   Residuals are tracked in a circular buffer and summarised as an
-   *   exponential-decay-weighted RMSE so that recent errors dominate.
-   *
-   *   Two thresholds govern the output:
-   *     warnThreshold   — RMSE above this fires 'webgazer-aac:drift-warning'
-   *     critThreshold   — RMSE above this fires 'webgazer-aac:drift-critical'
-   *
-   *   Between threshold crossings the watchdog is hysteretic: it won't emit
-   *   another event of the same level until the RMSE first falls back below
-   *   80% of the threshold, preventing event storms on jittery sessions.
-   *
-   *   All events carry a detail object:
-   *     { rmse, level, sampleCount, timestamp }
-   *
-   * Constructor options (all optional):
-   *   windowSize    {number} — max residuals to hold in the buffer (default 40)
-   *   decayAlpha    {number} — EMA weight per new sample, 0–1 (default 0.12)
-   *   minSamples    {number} — min samples before RMSE is considered valid (default 8)
-   *   warnThreshold {number} — RMSE px for warning level (default 120)
-   *   critThreshold {number} — RMSE px for critical level (default 220)
-   *   onWarn        {fn}     — optional callback in addition to CustomEvent
-   *   onCritical    {fn}     — optional callback in addition to CustomEvent
-   */
-  function DriftWatchdog(regression, options) {
-    options = options || {};
-    this.regression    = regression;
-    this.windowSize    = options.windowSize    || 40;
-    this.decayAlpha    = options.decayAlpha    || 0.12;
-    this.minSamples    = options.minSamples    || 8;
-    this.warnThreshold = options.warnThreshold || 120;
-    this.critThreshold = options.critThreshold || 220;
-    this.onWarn        = options.onWarn        || null;
-    this.onCritical    = options.onCritical    || null;
-
-    this._enabled      = false;
-    this._buffer       = [];          // raw residuals (circular)
-    this._weightedSS   = 0;           // weighted sum-of-squares
-    this._weightSum    = 0;           // weight accumulator
-    this._rmse         = 0;
-    this._sampleCount  = 0;
-    this._lastLevel    = 'ok';        // 'ok' | 'warning' | 'critical'
-    // Hysteresis: don't re-fire until RMSE drops below this fraction of threshold
-    this._hysteresis   = 0.8;
-  }
-
-  DriftWatchdog.prototype = {
-
-    enable()  { this._enabled = true;  return this; },
-    disable() { this._enabled = false; return this; },
-
-    /** Current weighted RMSE in pixels. 0 if insufficient samples. */
-    get rmse() { return this._rmse; },
-
-    /** Number of ground-truth samples recorded so far. */
-    get sampleCount() { return this._sampleCount; },
-
-    /**
-     * Record a ground-truth gaze position and compute residual.
-     * Called by the install() intercepts — you normally don't call this directly.
-     *
-     * @param {object} eyePatches  — raw patches from WebGazer
-     * @param {number} trueX       — confirmed screen X
-     * @param {number} trueY       — confirmed screen Y
-     */
-    record(eyePatches, trueX, trueY) {
-      if (!this._enabled || !this.regression) return;
-
-      let pred = null;
-      try { pred = this.regression.predict(eyePatches); } catch (e) {}
-      if (!pred) return; // not enough calibration data yet
-
-      const residual = Math.sqrt((pred.x - trueX) ** 2 + (pred.y - trueY) ** 2);
-      this._sampleCount++;
-
-      // Circular buffer — keep raw residuals for potential future use
-      this._buffer.push(residual);
-      if (this._buffer.length > this.windowSize) this._buffer.shift();
-
-      // Exponential-decay weighted RMSE
-      // Each new sample gets weight 1; existing accumulated weight decays by (1 - alpha)
-      this._weightedSS  = this._weightedSS  * (1 - this.decayAlpha) + residual * residual * this.decayAlpha;
-      this._weightSum   = this._weightSum   * (1 - this.decayAlpha) + this.decayAlpha;
-      this._rmse        = this._sampleCount >= this.minSamples
-        ? Math.sqrt(this._weightedSS / (this._weightSum || 1))
-        : 0;
-
-      if (this._rmse === 0) return;
-
-      // Level determination with hysteresis
-      const prevLevel = this._lastLevel;
-      let newLevel;
-
-      if (this._rmse >= this.critThreshold) {
-        newLevel = 'critical';
-      } else if (this._rmse >= this.warnThreshold) {
-        newLevel = 'warning';
-      } else {
-        newLevel = 'ok';
-      }
-
-      // Hysteresis: suppress upgrade if we haven't cooled down yet
-      if (newLevel !== 'ok' && newLevel === prevLevel) return; // same non-ok level, no re-fire
-
-      // Downgrade hysteresis: only clear a level once RMSE drops well below threshold
-      if (newLevel === 'ok' && prevLevel === 'critical' &&
-          this._rmse > this.critThreshold * this._hysteresis) return;
-      if (newLevel !== 'critical' && prevLevel === 'critical' &&
-          this._rmse > this.critThreshold * this._hysteresis) return;
-      if (newLevel === 'ok' && prevLevel === 'warning' &&
-          this._rmse > this.warnThreshold * this._hysteresis) return;
-
-      this._lastLevel = newLevel;
-      if (newLevel === 'ok') return; // cooled down, no event needed
-
-      this._emit(newLevel);
-    },
-
-    _emit(level) {
-      const detail = {
-        rmse:        Math.round(this._rmse),
-        level,
-        sampleCount: this._sampleCount,
-        timestamp:   Date.now(),
-      };
-      const eventName = level === 'critical'
-        ? 'webgazer-aac:drift-critical'
-        : 'webgazer-aac:drift-warning';
-      try {
-        if (typeof CustomEvent !== 'undefined' && typeof document !== 'undefined') {
-          document.dispatchEvent(new CustomEvent(eventName, { detail, bubbles: true }));
-        }
-      } catch (e) {}
-      if (level === 'critical' && typeof this.onCritical === 'function') {
-        try { this.onCritical(detail); } catch (e) {}
-      }
-      if (level === 'warning' && typeof this.onWarn === 'function') {
-        try { this.onWarn(detail); } catch (e) {}
-      }
-      console.warn('[webgazer-aac] drift-' + level + ': RMSE=' + detail.rmse + 'px ' +
-        '(n=' + detail.sampleCount + ')');
-    },
-
-    /** Reset all accumulated state (e.g. after a re-calibration). */
-    reset() {
-      this._buffer      = [];
-      this._weightedSS  = 0;
-      this._weightSum   = 0;
-      this._rmse        = 0;
-      this._sampleCount = 0;
-      this._lastLevel   = 'ok';
-    },
-  };
-
-  // ─── IndexedDB calibration persistence ───────────────────────────────────
-
-  /**
-   * CalibrationStore — saves and restores full calibration state to IndexedDB.
-   *
-   * What is persisted:
-   *   • Polynomial regression dataset   (features + screen positions + weights)
-   *   • RBF regression dataset          (same)
-   *   • PCA basis vectors + mean        (left + right eye)
-   *   • Kalman noise params             (Q, R)
-   *   • Metadata                        (version, timestamp, screenSize)
-   *
-   * API (all async, return Promises):
-   *   store.save(snapshot)   — persist a CalibrationSnapshot object
-   *   store.load()           — resolve with snapshot or null if none / incompatible
-   *   store.clear()          — delete stored calibration
-   *   store.available()      — resolve with boolean (false in private browsing)
-   *
-   * The store is keyed by `profileKey` so multiple users / devices can
-   * coexist in the same browser origin.
-   *
-   * Constructor options:
-   *   dbName     {string}  — IDB database name (default 'webgazer-aac')
-   *   storeName  {string}  — IDB object store name (default 'calibrations')
-   *   profileKey {string}  — record key within the store (default 'default')
-   *   backend    {object}  — optional mock backend for testing (see _MemoryBackend)
-   */
-  function CalibrationStore(options) {
-    options = options || {};
-    this.dbName     = options.dbName     || 'webgazer-aac';
-    this.storeName  = options.storeName  || 'calibrations';
-    this.profileKey = options.profileKey || 'default';
-    this._backend   = options.backend    || null; // null → use real IDB
-    this._db        = null; // cached IDB connection
-  }
-
-  CalibrationStore.prototype = {
-
-    /** Resolve with true if IDB is accessible. */
-    available() {
-      if (this._backend) return Promise.resolve(true);
-      return new Promise(resolve => {
-        if (typeof indexedDB === 'undefined') { resolve(false); return; }
-        try {
-          const req = indexedDB.open('__webgazer_aac_probe__', 1);
-          req.onsuccess  = e => { e.target.result.close(); resolve(true); };
-          req.onerror    = ()  => resolve(false);
-          req.onblocked  = ()  => resolve(false);
-        } catch (e) { resolve(false); }
-      });
-    },
-
-    /**
-     * Persist calibration state.
-     * @param {object} snapshot — produced by webgazerAAC.getCalibrationSnapshot()
-     * @returns {Promise<boolean>} true on success
-     */
-    save(snapshot) {
-      if (this._backend) return this._backend.save(this.profileKey, snapshot);
-      return this._openDB().then(db => new Promise((resolve, reject) => {
-        try {
-          const tx  = db.transaction(this.storeName, 'readwrite');
-          const req = tx.objectStore(this.storeName).put(snapshot, this.profileKey);
-          req.onsuccess = () => resolve(true);
-          req.onerror   = e  => reject(e.target.error);
-        } catch (e) { reject(e); }
-      }));
-    },
-
-    /**
-     * Load persisted calibration state.
-     * @returns {Promise<object|null>} snapshot or null if not found / version mismatch
-     */
-    load() {
-      const checkVersion = result => {
-        if (!result || result.aacVersion !== '1.3.0') return null;
-        // Screen size mismatch warning — caller decides whether to use
-        if (result.screenWidth  !== (typeof window !== 'undefined' ? window.innerWidth  : 0) ||
-            result.screenHeight !== (typeof window !== 'undefined' ? window.innerHeight : 0)) {
-          result._screenMismatch = true;
-        }
-        return result;
-      };
-
-      if (this._backend) {
-        return this._backend.load(this.profileKey).then(checkVersion);
-      }
-      return this._openDB().then(db => new Promise((resolve, reject) => {
-        try {
-          const tx  = db.transaction(this.storeName, 'readonly');
-          const req = tx.objectStore(this.storeName).get(this.profileKey);
-          req.onsuccess = e => resolve(checkVersion(e.target.result));
-          req.onerror   = e => reject(e.target.error);
-        } catch (e) { reject(e); }
-      }));
-    },
-
-    /** Delete stored calibration for this profile. */
-    clear() {
-      if (this._backend) return this._backend.clear(this.profileKey);
-      return this._openDB().then(db => new Promise((resolve, reject) => {
-        try {
-          const tx  = db.transaction(this.storeName, 'readwrite');
-          const req = tx.objectStore(this.storeName).delete(this.profileKey);
-          req.onsuccess = () => resolve(true);
-          req.onerror   = e  => reject(e.target.error);
-        } catch (e) { reject(e); }
-      }));
-    },
-
-    _openDB() {
-      if (this._db) return Promise.resolve(this._db);
-      const self = this;
-      return new Promise((resolve, reject) => {
-        if (typeof indexedDB === 'undefined') { reject(new Error('IDB unavailable')); return; }
-        try {
-          const req = indexedDB.open(self.dbName, 1);
-          req.onupgradeneeded = e => {
-            const db = e.target.result;
-            if (!db.objectStoreNames.contains(self.storeName)) {
-              db.createObjectStore(self.storeName);
-            }
-          };
-          req.onsuccess = e => { self._db = e.target.result; resolve(self._db); };
-          req.onerror   = e => reject(e.target.error);
-        } catch (e) { reject(e); }
-      });
-    },
-  };
-
-  /**
-   * In-memory IDB backend for testing — no real IDB needed.
-   * Pass as `backend` option to CalibrationStore constructor.
-   */
-  function _MemoryBackend() { this._store = {}; }
-  _MemoryBackend.prototype = {
-    save(key, value) { this._store[key] = JSON.parse(JSON.stringify(value)); return Promise.resolve(true); },
-    load(key)        { const v = this._store[key]; return Promise.resolve(v ? JSON.parse(JSON.stringify(v)) : null); },
-    clear(key)       { delete this._store[key]; return Promise.resolve(true); },
-  };
-
-  // ─── Adaptive recalibration ───────────────────────────────────────────────
-
-  function AdaptiveRecalibrator(regressionModule) {
-    this.regression = regressionModule;
-    this.enabled    = false;
-    this.hitCount   = 0;
+  function AdaptiveRecalibrator(owner) {
+    this.owner = owner;
+    this.enabled = false;
+    this.hitCount = 0;
     this.maxHitsPerSession = 500;
   }
-
-  AdaptiveRecalibrator.prototype = {
-    enable()  { this.enabled = true; },
-    disable() { this.enabled = false; },
-    recordHit(targetX, targetY, eyePatches, importance) {
-      if (!this.enabled || this.hitCount >= this.maxHitsPerSession) return;
-      importance = importance != null ? importance : 1.5;
-      this.regression.addData(eyePatches, targetX, targetY, importance);
-      this.hitCount++;
-    },
-    recordElementHit(element, eyePatches) {
-      if (!element || !this.enabled) return;
-      const r = element.getBoundingClientRect();
-      this.recordHit(r.left + r.width / 2, r.top + r.height / 2, eyePatches);
-    },
+  AdaptiveRecalibrator.prototype.enable = function () { this.enabled = true; return this; };
+  AdaptiveRecalibrator.prototype.disable = function () { this.enabled = false; return this; };
+  AdaptiveRecalibrator.prototype.recordNormalized = function (normalized, x, y, weight, source) {
+    if (!this.enabled || !normalized || this.hitCount >= this.maxHitsPerSession) return false;
+    this.owner.recordGroundTruth(x, y, {
+      normalized,
+      source: source || 'dwell-selection',
+      evidenceWeight: weight,
+      includeInCalibration: false,
+      adaptive: true,
+    });
+    this.hitCount++;
+    return true;
   };
 
-  // ─── Main install ─────────────────────────────────────────────────────────
+  const DEFAULT_TARGET_SELECTOR = [
+    '[data-gaze-target]', 'button', 'a[href]', 'input:not([type="hidden"])', 'select', 'textarea',
+    '[role="button"]', '[role="option"]', '[role="menuitem"]', '[role="tab"]', '[role="switch"]',
+    '[tabindex]:not([tabindex="-1"])',
+  ].join(',');
 
-  const webgazerAAC = {
-    _regression:     null,
-    _kalman:         new KalmanFilter(),
-    _blink:          new BlinkDetector(),
-    _saccade:        new SaccadeDetector(),
-    _cache:          new FrameCache(),
-    _recalibrator:   null,
-    _watchdog:       null,
-    _store:          null,
-    _currentMode:    'ensemble',
-    _installed:      false,
-    _lastPatches:    null,
-    _lastConfidence: 0,
-    _lastResult:     null,
+  function rectOf(el) {
+    if (!el || typeof el.getBoundingClientRect !== 'function') return null;
+    try {
+      const r = el.getBoundingClientRect();
+      const left = finite(r.left, 0), top = finite(r.top, 0);
+      const width = finite(r.width, finite(r.right, left) - left);
+      const height = finite(r.height, finite(r.bottom, top) - top);
+      return { left, top, right: finite(r.right, left + width), bottom: finite(r.bottom, top + height), width, height };
+    } catch (_) { return null; }
+  }
 
-    install() {
-      if (this._installed) return this;
-      if (typeof webgazer === 'undefined') {
-        console.error('[webgazer-aac] webgazer.js must be loaded first');
-        return this;
-      }
+  function isDisabledTarget(el) {
+    if (!el) return true;
+    if (el.disabled) return true;
+    if (typeof el.getAttribute === 'function') {
+      const aria = el.getAttribute('aria-disabled');
+      if (aria === 'true') return true;
+    }
+    return false;
+  }
 
+  function GazeTargetResolver(options) {
+    options = options || {};
+    this.selector = options.selector || DEFAULT_TARGET_SELECTOR;
+    this.expansionPx = options.expansionPx == null ? 48 : options.expansionPx;
+    this.maxDistancePx = options.maxDistancePx == null ? 180 : options.maxDistancePx;
+    this.hysteresisBonus = options.hysteresisBonus == null ? 0.22 : options.hysteresisBonus;
+    this.cacheMs = options.cacheMs == null ? 120 : options.cacheMs;
+    this._lastTarget = null;
+    this._cacheRoot = null;
+    this._cacheAt = -Infinity;
+    this._cacheTargets = [];
+  }
+  GazeTargetResolver.prototype._targets = function (root) {
+    root = root || global.document;
+    const now = perfNow();
+    if (root === this._cacheRoot && now - this._cacheAt <= this.cacheMs) return this._cacheTargets;
+    let list = [];
+    try { list = Array.from(root && root.querySelectorAll ? root.querySelectorAll(this.selector) : []); } catch (_) {}
+    this._cacheRoot = root; this._cacheAt = now; this._cacheTargets = list.filter(el => !isDisabledTarget(el));
+    return this._cacheTargets;
+  };
+  GazeTargetResolver.prototype.invalidate = function () { this._cacheAt = -Infinity; this._cacheTargets = []; };
+  GazeTargetResolver.prototype.resolveElement = function (element, x, y) {
+    if (!element) return null;
+    let target = null;
+    try { target = typeof element.closest === 'function' ? element.closest(this.selector) : element; } catch (_) { target = element; }
+    if (!target || isDisabledTarget(target)) return null;
+    const rect = rectOf(target);
+    if (!rect) return null;
+    const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
+    const distance = Math.hypot((x == null ? cx : x) - cx, (y == null ? cy : y) - cy);
+    this._lastTarget = target;
+    return { element: target, confidence: 1, targetConfidence: 1, rect, distance, crowding: 0 };
+  };
+  GazeTargetResolver.prototype.resolve = function (x, y, root) {
+    const candidates = this._targets(root);
+    if (!candidates.length) return null;
+    const scored = [];
+    for (const el of candidates) {
+      const r = rectOf(el);
+      if (!r || r.width <= 0 || r.height <= 0) continue;
+      const ex = this.expansionPx;
+      const dx = x < r.left - ex ? (r.left - ex - x) : x > r.right + ex ? (x - r.right - ex) : 0;
+      const dy = y < r.top - ex ? (r.top - ex - y) : y > r.bottom + ex ? (y - r.bottom - ex) : 0;
+      const outsideDistance = Math.hypot(dx, dy);
+      if (outsideDistance > this.maxDistancePx) continue;
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      const centerDistance = Math.hypot(x - cx, y - cy);
+      const inside = x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+      const scale = Math.max(40, Math.min(180, Math.sqrt(r.width * r.height)));
+      let score = inside ? 1.2 : Math.exp(-(outsideDistance * outsideDistance) / (2 * scale * scale));
+      score *= 0.85 + 0.15 * Math.exp(-centerDistance / Math.max(1, scale * 2));
+      if (el === this._lastTarget) score *= 1 + this.hysteresisBonus;
+      scored.push({ element: el, rect: r, score: Math.max(1e-9, score), distance: centerDistance });
+    }
+    if (!scored.length) return null;
+    scored.sort((a, b) => b.score - a.score);
+    const best = scored[0];
+    const total = scored.reduce((s, c) => s + c.score, 0);
+    const confidence = clamp(best.score / Math.max(best.score, total), 0, 1);
+    const near = scored.filter(c => c !== best && c.distance < this.maxDistancePx).length;
+    const crowding = clamp(near / 4, 0, 1);
+    this._lastTarget = best.element;
+    return {
+      element: best.element,
+      confidence,
+      targetConfidence: confidence,
+      rect: best.rect,
+      distance: best.distance,
+      crowding,
+      candidateCount: scored.length,
+    };
+  };
+
+  function AdaptiveDwellController(options) {
+    options = options || {};
+    this.baseMs = options.baseMs == null ? 800 : options.baseMs;
+    this.minMs = options.minMs == null ? 400 : options.minMs;
+    this.maxMs = options.maxMs == null ? 1400 : options.maxMs;
+    this.correctionPressure = 0;
+  }
+  AdaptiveDwellController.prototype.noteCorrection = function () { this.correctionPressure = clamp(this.correctionPressure + 0.15, 0, 1); };
+  AdaptiveDwellController.prototype.noteSuccess = function () { this.correctionPressure = clamp(this.correctionPressure - 0.04, 0, 1); };
+  AdaptiveDwellController.prototype.getDwellMs = function (ctx) {
+    ctx = ctx || {};
+    const q = clamp(finite(ctx.trackingQuality, 0.5), 0, 1);
+    const tc = clamp(finite(ctx.targetConfidence, 0.5), 0, 1);
+    const area = Math.max(1, finite(ctx.targetArea, 4000));
+    const crowding = clamp(finite(ctx.crowding, 0), 0, 1);
+    const qualityPenalty = (1 - q) * 0.45;
+    const confidencePenalty = (1 - tc) * 0.5;
+    const sizePenalty = clamp((5000 - area) / 5000, 0, 1) * 0.35;
+    const crowdingPenalty = crowding * 0.35;
+    const correctionPenalty = this.correctionPressure * 0.3;
+    const highQualityDiscount = q > 0.85 && tc > 0.85 && area > 8000 ? 0.18 : 0;
+    const factor = 1 + qualityPenalty + confidencePenalty + sizePenalty + crowdingPenalty + correctionPenalty - highQualityDiscount;
+    return clamp(Math.round(this.baseMs * factor), this.minMs, this.maxMs);
+  };
+
+  function targetAnchor(element) {
+    if (!element) return null;
+    const r = rectOf(element);
+    if (!r) return null;
+    let x = r.left + r.width / 2;
+    let y = r.top + r.height / 2;
+    const ds = element.dataset || {};
+    if (ds.gazeX != null && Number.isFinite(Number(ds.gazeX))) x = Number(ds.gazeX);
+    if (ds.gazeY != null && Number.isFinite(Number(ds.gazeY))) y = Number(ds.gazeY);
+    if (typeof element.getAttribute === 'function') {
+      const ax = element.getAttribute('data-gaze-x');
+      const ay = element.getAttribute('data-gaze-y');
+      if (ax != null && Number.isFinite(Number(ax))) x = Number(ax);
+      if (ay != null && Number.isFinite(Number(ay))) y = Number(ay);
+    }
+    return { x, y, rect: r };
+  }
+
+  function DwellTimer(options) {
+    options = options || {};
+    this.dwellMs = options.dwellMs == null ? 800 : options.dwellMs;
+    this.minTrackingQuality = options.minTrackingQuality == null
+      ? (options.minConfidence == null ? 0.25 : options.minConfidence)
+      : options.minTrackingQuality;
+    this.minTargetConfidence = options.minTargetConfidence == null ? 0.25 : options.minTargetConfidence;
+    this.holdAfterMs = options.holdAfterMs == null ? 1200 : options.holdAfterMs;
+    this.adaptive = options.adaptive !== false;
+    this._aacRef = options.aacRef || null;
+    this._resolver = options.resolver || (this._aacRef && this._aacRef._targetResolver) || new GazeTargetResolver();
+    this._controller = options.controller || new AdaptiveDwellController({ baseMs: this.dwellMs });
+    this.reset();
+  }
+  DwellTimer.prototype.reset = function () {
+    this._target = null; this._progress = 0; this._lastT = null; this._holdUntil = 0; this._requiredMs = this.dwellMs;
+  };
+  Object.defineProperty(DwellTimer.prototype, 'progress', { get: function () { return this._progress; } });
+  DwellTimer.prototype.update = function (element, x, y, trackingQuality, isSaccade, isBlink, targetConfidence, meta) {
+    const now = perfNow();
+    if (element == null || isBlink) { this._lastT = now; return this._progress; }
+    if (element !== this._target) {
+      if (this._target && this._progress > 0) dispatch(this._target, 'webgazer-aac:dwell-cancel', { reason: 'target-changed', x, y });
+      this._target = element; this._progress = 0; this._lastT = now;
+      const r = rectOf(element);
+      const area = r ? r.width * r.height : 0;
+      const tc0 = targetConfidence == null ? 1 : targetConfidence;
+      this._requiredMs = this.adaptive
+        ? this._controller.getDwellMs({ trackingQuality, targetConfidence: tc0, targetArea: area, crowding: meta && meta.crowding })
+        : this.dwellMs;
+      return 0;
+    }
+    const dt = this._lastT == null ? 0 : clamp(now - this._lastT, 0, 150);
+    this._lastT = now;
+    const tc = targetConfidence == null ? 1 : targetConfidence;
+    const frozen = !!isSaccade || trackingQuality < this.minTrackingQuality || tc < this.minTargetConfidence || now < this._holdUntil;
+    if (!frozen) this._progress = clamp(this._progress + dt / Math.max(1, this._requiredMs), 0, 1);
+    dispatch(element, 'webgazer-aac:dwell-progress', {
+      progress: this._progress, trackingQuality, targetConfidence: tc, x, y, frozen, requiredMs: this._requiredMs,
+    });
+    if (this._progress >= 1 && now >= this._holdUntil) {
+      this._holdUntil = now + this.holdAfterMs;
+      this._progress = 0;
+      dispatch(element, 'webgazer-aac:dwell-complete', { x, y, trackingQuality, targetConfidence: tc });
+      if (this._aacRef) this._aacRef.recordConfirmedSelection(element, { source: 'dwell-selection', evidenceWeight: EVIDENCE_WEIGHTS['dwell-selection'] });
+      this._controller.noteSuccess();
+    }
+    return this._progress;
+  };
+  DwellTimer.prototype.updateFromGaze = function (gaze, root) {
+    if (!gaze) { this._lastT = perfNow(); return this._progress; }
+    const result = this._resolver.resolve(gaze.x, gaze.y, root);
+    if (!result) {
+      if (this._target && this._progress > 0) dispatch(this._target, 'webgazer-aac:dwell-cancel', { reason: 'no-target', x: gaze.x, y: gaze.y });
+      this._target = null; this._progress = 0; this._lastT = perfNow();
+      return 0;
+    }
+    return this.update(result.element, gaze.x, gaze.y, gaze.trackingQuality == null ? gaze.confidence : gaze.trackingQuality,
+      !!gaze.isSaccade, !!gaze.isBlink, result.confidence, result);
+  };
+
+  function _MemoryBackend() { this._store = Object.create(null); }
+  _MemoryBackend.prototype.save = function (key, value) { this._store[key] = JSON.parse(JSON.stringify(value)); return Promise.resolve(true); };
+  _MemoryBackend.prototype.load = function (key) { const v = this._store[key]; return Promise.resolve(v ? JSON.parse(JSON.stringify(v)) : null); };
+  _MemoryBackend.prototype.clear = function (key) { delete this._store[key]; return Promise.resolve(true); };
+
+  function CalibrationStore(options) {
+    options = options || {};
+    this.dbName = options.dbName || 'webgazer-aac';
+    this.storeName = options.storeName || 'calibrations';
+    this.profileKey = options.profileKey || 'default';
+    this._backend = options.backend || null;
+    this._db = null;
+  }
+  CalibrationStore.prototype._check = function (snap) {
+    if (!snap) return null;
+    if (snap.schemaVersion !== SCHEMA_VERSION) { snap._incompatibleReason = 'schema-version'; return snap; }
+    if (snap.featureVersion !== FEATURE_VERSION) { snap._incompatibleReason = 'feature-version'; return snap; }
+    const vw = viewportWidth(), vh = viewportHeight(), dpr = devicePixelRatio();
+    const sizeChanged = snap.viewport && (Math.abs((snap.viewport.width || 0) - vw) > Math.max(32, vw * 0.05) || Math.abs((snap.viewport.height || 0) - vh) > Math.max(32, vh * 0.05));
+    const dprChanged = snap.viewport && Math.abs((snap.viewport.dpr || 1) - dpr) > 0.25;
+    if (sizeChanged || dprChanged) snap._validationRequired = true;
+    return snap;
+  };
+  CalibrationStore.prototype.available = function () {
+    if (this._backend) return Promise.resolve(true);
+    if (typeof global.indexedDB === 'undefined') return Promise.resolve(false);
+    return this._open().then(() => true).catch(() => false);
+  };
+  CalibrationStore.prototype.save = function (snap) {
+    if (this._backend) return this._backend.save(this.profileKey, snap);
+    return this._open().then(db => new Promise((resolve, reject) => {
+      try {
+        const req = db.transaction(this.storeName, 'readwrite').objectStore(this.storeName).put(snap, this.profileKey);
+        req.onsuccess = () => resolve(true); req.onerror = e => reject(e.target.error);
+      } catch (e) { reject(e); }
+    }));
+  };
+  CalibrationStore.prototype.load = function () {
+    if (this._backend) return this._backend.load(this.profileKey).then(s => this._check(s));
+    return this._open().then(db => new Promise((resolve, reject) => {
+      try {
+        const req = db.transaction(this.storeName, 'readonly').objectStore(this.storeName).get(this.profileKey);
+        req.onsuccess = e => resolve(this._check(e.target.result)); req.onerror = e => reject(e.target.error);
+      } catch (e) { reject(e); }
+    }));
+  };
+  CalibrationStore.prototype.clear = function () {
+    if (this._backend) return this._backend.clear(this.profileKey);
+    return this._open().then(db => new Promise((resolve, reject) => {
+      try {
+        const req = db.transaction(this.storeName, 'readwrite').objectStore(this.storeName).delete(this.profileKey);
+        req.onsuccess = () => resolve(true); req.onerror = e => reject(e.target.error);
+      } catch (e) { reject(e); }
+    }));
+  };
+  CalibrationStore.prototype._open = function () {
+    if (this._db) return Promise.resolve(this._db);
+    if (typeof global.indexedDB === 'undefined') return Promise.reject(new Error('IndexedDB unavailable'));
+    return new Promise((resolve, reject) => {
+      try {
+        const req = global.indexedDB.open(this.dbName, 1);
+        req.onupgradeneeded = e => {
+          const db = e.target.result;
+          if (!db.objectStoreNames.contains(this.storeName)) db.createObjectStore(this.storeName);
+        };
+        req.onsuccess = e => { this._db = e.target.result; resolve(this._db); };
+        req.onerror = e => reject(e.target.error);
+      } catch (e) { reject(e); }
+    });
+  };
+
+  const api = {
+    version: LIBRARY_VERSION,
+    libraryVersion: LIBRARY_VERSION,
+    schemaVersion: SCHEMA_VERSION,
+    featureVersion: FEATURE_VERSION,
+    EVIDENCE_WEIGHTS,
+
+    _installed: false,
+    _origSetGazeListener: null,
+    _origRecordScreenPosition: null,
+    _lastEyeFeatures: null,
+    _lastNormalized: null,
+    _lastResult: null,
+    _trackingQuality: 0,
+    _gazeStability: 0,
+    _trainingRecords: [],
+    _calibrationRecords: [],
+    _store: null,
+    _currentMode: 'ensemble',
+    _videoClock: null,
+    _diagnostics: {
+      frames: 0, eyeFeatureFrames: 0, fallbackFrames: 0, blinkFrames: 0, saccadeFrames: 0,
+      explicitSamples: 0, adaptiveSamples: 0, calibrationSamples: 0,
+      firstFrameAt: 0, lastFrameAt: 0, videoFrames: 0, lastVideoMetadata: null,
+    },
+
+    _normalizeEyeFeatures: normalizeEyeFeatures,
+
+    _initModels() {
+      if (this._regressions) return;
       const poly = new PolynomialRegression();
-      const rbf  = new RBFRegression();
+      const rbf = new RBFRegression();
+      this._regressions = { polynomial: poly, rbf, ensemble: new EnsembleRegression(poly, rbf) };
+      this._regression = this._regressions.ensemble;
+      this._kalman = new KalmanFilter();
+      this._blink = new BlinkDetector();
+      this._saccade = new SaccadeDetector();
+      this._recalibrator = new AdaptiveRecalibrator(this);
+      this._watchdog = new DriftWatchdog(this);
+      this._targetResolver = new GazeTargetResolver();
+    },
 
-      this._regressions = {
-        polynomial: poly,
-        rbf:        rbf,
-        ensemble:   new EnsembleRegression(poly, rbf),
-      };
-
-      this.setRegression('ensemble');
-
+    install(options) {
+      this._initModels();
+      options = options || {};
+      if (this._installed) return this;
+      const wg = global.webgazer;
+      if (!wg || typeof wg.setGazeListener !== 'function' || typeof wg.recordScreenPosition !== 'function') {
+        throw new Error('[webgazer-aac] WebGazer must be loaded before install()');
+      }
       const self = this;
+      this._origSetGazeListener = wg.setGazeListener.bind(wg);
+      this._origRecordScreenPosition = wg.recordScreenPosition.bind(wg);
 
-      // Intercept setGazeListener
-      const _origSetGazeListener = webgazer.setGazeListener.bind(webgazer);
-      webgazer.setGazeListener = function (callback) {
-        return _origSetGazeListener(function (data, elapsedTime) {
-          // Cache latest eye patches
-          try {
-            const tracker = webgazer.getTracker();
-            if (tracker) {
-              self._lastPatches =
-                (tracker.getEyePatches && tracker.getEyePatches()) ||
-                (tracker.getCurrentEyePatches && tracker.getCurrentEyePatches()) ||
-                (webgazer.getCurrentEyePatches && webgazer.getCurrentEyePatches()) || null;
-            }
-          } catch (e) {}
+      wg.setGazeListener = function (callback) {
+        return self._origSetGazeListener(function (data, elapsedTime) {
+          self._diagnostics.frames++;
+          const t = perfNow();
+          if (!self._diagnostics.firstFrameAt) self._diagnostics.firstFrameAt = t;
+          self._diagnostics.lastFrameAt = t;
+          if (!data) { callback(null, elapsedTime); return; }
 
-          if (data === null) { callback(null, elapsedTime); return; }
+          const eyeFeatures = data.eyeFeatures || null;
+          const normalized = normalizeEyeFeatures(eyeFeatures);
+          self._lastEyeFeatures = eyeFeatures;
+          self._lastNormalized = normalized;
+          if (normalized) self._diagnostics.eyeFeatureFrames++; else self._diagnostics.fallbackFrames++;
 
-          // Blink detection
-          const isBlink = self._blink.update(self._lastPatches);
+          const blink = eyeFeatures ? self._blink.update(eyeFeatures) : false;
+          if (blink) self._diagnostics.blinkFrames++;
 
-          // Saccade detection (from Kalman velocity)
-          const vx = self._lastResult ? self._lastResult.vx : 0;
-          const vy = self._lastResult ? self._lastResult.vy : 0;
-          const isSaccade = self._saccade.isSaccade(vx, vy);
+          let raw = normalized ? self._predictRegression(normalized) : null;
+          if (!raw) raw = { x: finite(data.x, 0), y: finite(data.y, 0) };
 
-          // Frame cache — skip inference if stable
-          let rawX, rawY;
-          if (self._cache.shouldSkip(vx, vy) && self._cache.get()) {
-            const cached = self._cache.get();
-            rawX = cached.x; rawY = cached.y;
-          } else {
-            // Regression inference
-            let pred = null;
-            if (self._regression && self._lastPatches) {
-              try { pred = self._regression.predict(self._lastPatches); } catch (e) {}
-            }
-            rawX = pred ? pred.x : data.x;
-            rawY = pred ? pred.y : data.y;
-            self._cache.store({ x: rawX, y: rawY });
-          }
+          const priorVx = self._lastResult ? self._lastResult.vx : 0;
+          const priorVy = self._lastResult ? self._lastResult.vy : 0;
+          const saccade = self._saccade.isSaccade(priorVx, priorVy);
+          if (saccade) self._diagnostics.saccadeFrames++;
 
-          // Kalman filter
-          const result = self._kalman.smooth(rawX, rawY, isBlink, isSaccade);
-          self._lastResult     = result;
-          self._lastConfidence = result.confidence;
+          const filtered = self._kalman.smooth(raw.x, raw.y, blink || saccade);
+          const featureFactor = normalized ? 1 : 0.45;
+          const trackingQuality = clamp(filtered.stability * 0.8 + featureFactor * 0.2, 0, 1);
+          self._lastResult = filtered;
+          self._trackingQuality = trackingQuality;
+          self._gazeStability = filtered.stability;
 
-          // During blink: pass null so dwell timers don't advance
-          if (isBlink) { callback(null, elapsedTime); return; }
-
+          if (blink) { callback(null, elapsedTime); return; }
           callback({
-            x:          result.x,
-            y:          result.y,
-            confidence: result.confidence,
-            isSaccade,
+            x: filtered.x, y: filtered.y, vx: filtered.vx, vy: filtered.vy,
+            isSaccade: saccade, isBlink: false,
+            gazeStability: filtered.stability,
+            trackingQuality,
+            confidence: trackingQuality,
+            eyeFeaturesAvailable: !!normalized,
           }, elapsedTime);
         });
       };
 
-      // Intercept recordScreenPosition to feed our model
-      const _origRecord = webgazer.recordScreenPosition.bind(webgazer);
-      webgazer.recordScreenPosition = function (x, y, eventType) {
-        _origRecord(x, y, eventType);
-        if (self._regression && self._lastPatches) {
-          try {
-            self._regression.addData(self._lastPatches, x, y);
-            // Track ensemble error
-            if (self._regression instanceof EnsembleRegression)
-              self._regression.trackError(self._lastPatches, x, y);
-            // Drift watchdog — record residual against ground truth
-            if (self._watchdog) self._watchdog.record(self._lastPatches, x, y);
-          } catch (e) {}
-        }
+      wg.recordScreenPosition = function (x, y, eventType) {
+        const result = self._origRecordScreenPosition(x, y, eventType);
+        const source = eventType === 'click' ? 'confirmed-click' : 'explicit';
+        const includeInCalibration = eventType !== 'move';
+        self.recordGroundTruth(x, y, {
+          normalized: self._lastNormalized,
+          source,
+          evidenceWeight: EVIDENCE_WEIGHTS[source],
+          includeInCalibration,
+        });
+        return result;
       };
 
-      this._recalibrator = new AdaptiveRecalibrator(this._regressions.ensemble);
-      this._watchdog     = new DriftWatchdog(this._regressions.ensemble);
-      this._store        = new CalibrationStore();
-      this._installed    = true;
-      console.info('[webgazer-aac] v1.3.0 installed — regression: ' + this._currentMode);
+      if (options.regression) this.setRegression(options.regression);
+      this._installed = true;
       return this;
     },
 
-    /**
-     * Fit the per-user PCA basis from patches collected during calibration.
-     * Call this at the END of your calibration sequence.
-     * Returns {left: bool, right: bool} indicating whether each eye fit succeeded.
-     */
+    _predictRegression(normalized) {
+      if (!normalized || this._currentMode === 'ridge' || !this._regression) return null;
+      try { return this._regression.predictNormalized(normalized); } catch (_) { return null; }
+    },
+
+    _addTrainingRecord(record) {
+      this._trainingRecords.push(record);
+      if (this._trainingRecords.length > 500) this._trainingRecords.shift();
+      if (record.includeInCalibration) {
+        this._calibrationRecords.push(record);
+        if (this._calibrationRecords.length > 300) this._calibrationRecords.shift();
+      }
+      this._regressions.ensemble.addNormalized(record.normalized, record.x, record.y, record.weight, record.source);
+    },
+
+    recordGroundTruth(x, y, options) {
+      this._initModels();
+      options = options || {};
+      const normalized = options.normalized || this._lastNormalized;
+      if (!normalized || !Number.isFinite(x) || !Number.isFinite(y)) return false;
+      const source = options.source || 'explicit';
+      const weight = clamp(options.evidenceWeight == null ? (EVIDENCE_WEIGHTS[source] == null ? 0.5 : EVIDENCE_WEIGHTS[source]) : options.evidenceWeight, 0.01, 1);
+
+      if (this._watchdog) this._watchdog.record(normalized, x, y, weight);
+      if (this._regressions && this._regressions.ensemble) this._regressions.ensemble.trackErrorNormalized(normalized, x, y);
+
+      const record = {
+        normalized: cloneNormalized(normalized), x, y, weight, source,
+        includeInCalibration: !!options.includeInCalibration,
+      };
+      this._addTrainingRecord(record);
+      if (options.adaptive) this._diagnostics.adaptiveSamples++;
+      else this._diagnostics.explicitSamples++;
+      if (record.includeInCalibration) this._diagnostics.calibrationSamples++;
+      return true;
+    },
+
     fitUserBasis() {
-      const lOk = LEFT_PCA.fit(_calibPatches.left);
-      const rOk = RIGHT_PCA.fit(_calibPatches.right);
-      const msg = `PCA fit — left: ${lOk ? _calibPatches.left.length + ' patches' : 'insufficient data'}, ` +
-                  `right: ${rOk ? _calibPatches.right.length + ' patches' : 'insufficient data'}`;
-      console.info('[webgazer-aac] ' + msg);
-      // Invalidate regression caches so they re-fit with new features
-      Object.values(this._regressions || {}).forEach(r => { if (r._dirty !== undefined) r._dirty = true; });
-      return { left: lOk, right: rOk, message: msg };
+      this._initModels();
+      const left = this._calibrationRecords.map(r => r.normalized.left);
+      const right = this._calibrationRecords.map(r => r.normalized.right);
+      const lOk = LEFT_PCA.fit(left);
+      const rOk = RIGHT_PCA.fit(right);
+      let rebuilt = false;
+      if (lOk && rOk) {
+        this._regressions.polynomial.clear();
+        this._regressions.rbf.clear();
+        for (const r of this._trainingRecords) this._regressions.ensemble.addNormalized(r.normalized, r.x, r.y, r.weight, r.source);
+        rebuilt = true;
+      }
+      return { left: lOk, right: rOk, samples: this._calibrationRecords.length, rebuilt };
     },
 
-    /** Clear collected calibration patches (call before a fresh calibration) */
     resetCalibrationPatches() {
-      _calibPatches.left  = [];
-      _calibPatches.right = [];
-      return this;
-    },
-
-    setRegression(mode) {
-      if (mode === 'ridge') {
-        this._regression  = null;
-        this._currentMode = 'ridge';
-        if (typeof webgazer !== 'undefined') webgazer.setRegression('ridge');
-        return this;
-      }
-      const reg = this._regressions && this._regressions[mode];
-      if (!reg) { console.warn('[webgazer-aac] unknown regression:', mode); return this; }
-      this._regression  = reg;
-      this._currentMode = mode;
-      if (this._recalibrator) this._recalibrator.regression = reg;
-      return this;
-    },
-
-    enableAdaptiveRecalibration()  { if (this._recalibrator) this._recalibrator.enable();  return this; },
-    disableAdaptiveRecalibration() { if (this._recalibrator) this._recalibrator.disable(); return this; },
-
-    /**
-     * Enable the drift watchdog.
-     * Optionally pass options to override defaults (warnThreshold, critThreshold,
-     * windowSize, decayAlpha, minSamples, onWarn, onCritical).
-     * Listen for events on document:
-     *   document.addEventListener('webgazer-aac:drift-warning',  e => ...)
-     *   document.addEventListener('webgazer-aac:drift-critical', e => ...)
-     */
-    enableDriftWatchdog(options) {
-      if (!this._watchdog) {
-        // install() not yet called — create with current regression (null OK, updated later)
-        this._watchdog = new DriftWatchdog(this._regression, options);
-      } else if (options) {
-        // Merge new options into existing watchdog
-        if (options.warnThreshold != null)  this._watchdog.warnThreshold = options.warnThreshold;
-        if (options.critThreshold != null)  this._watchdog.critThreshold = options.critThreshold;
-        if (options.windowSize    != null)  this._watchdog.windowSize    = options.windowSize;
-        if (options.decayAlpha    != null)  this._watchdog.decayAlpha    = options.decayAlpha;
-        if (options.minSamples    != null)  this._watchdog.minSamples    = options.minSamples;
-        if (options.onWarn        != null)  this._watchdog.onWarn        = options.onWarn;
-        if (options.onCritical    != null)  this._watchdog.onCritical    = options.onCritical;
-      }
-      this._watchdog.enable();
-      return this;
-    },
-
-    disableDriftWatchdog() {
-      if (this._watchdog) this._watchdog.disable();
-      return this;
-    },
-
-    /** Reset drift watchdog state (call after re-calibration). */
-    resetDriftWatchdog() {
+      this._initModels();
+      this._trainingRecords = [];
+      this._calibrationRecords = [];
+      this._regressions.polynomial.clear();
+      this._regressions.rbf.clear();
+      LEFT_PCA.reset(); RIGHT_PCA.reset();
+      this._diagnostics.explicitSamples = 0;
+      this._diagnostics.adaptiveSamples = 0;
+      this._diagnostics.calibrationSamples = 0;
       if (this._watchdog) this._watchdog.reset();
       return this;
     },
 
-    /** Current drift RMSE in pixels (0 if watchdog disabled or insufficient data). */
-    getDriftRmse() {
-      return this._watchdog ? this._watchdog.rmse : 0;
-    },
+    isPCAFitted() { return LEFT_PCA.fitted && RIGHT_PCA.fitted; },
 
-    // ── Confidence-gated dwell ──────────────────────────────────────────────
-
-    /**
-     * Create a DwellTimer wired to this webgazerAAC instance.
-     * The returned timer's update() will automatically call recordDwellHitXY()
-     * on completion, feeding the drift watchdog and adaptive recalibrator.
-     *
-     * @param {object} options — { dwellMs, minConfidence, holdAfterMs }
-     * @returns {DwellTimer}
-     *
-     * Example usage inside setGazeListener:
-     *   webgazer.setGazeListener((data) => {
-     *     if (!data) return;
-     *     const el = document.elementFromPoint(data.x, data.y);
-     *     timer.update(el, data.x, data.y, data.confidence, data.isSaccade);
-     *   });
-     */
-    createDwellTimer(options) {
-      options = Object.assign({}, options || {}, { aacRef: this });
-      return new DwellTimer(options);
-    },
-
-    // ── IndexedDB calibration persistence ──────────────────────────────────
-
-    /**
-     * Configure the CalibrationStore (optional — defaults are sensible).
-     * Call before install() if you need a custom dbName, storeName, or profileKey.
-     * @param {object} options — { dbName, storeName, profileKey }
-     */
-    configureStore(options) {
-      this._store = new CalibrationStore(options || {});
+    setRegression(mode) {
+      this._initModels();
+      mode = mode || 'ensemble';
+      if (mode === 'ridge') {
+        this._currentMode = 'ridge'; this._regression = null;
+        if (global.webgazer && typeof global.webgazer.setRegression === 'function') try { global.webgazer.setRegression('ridge'); } catch (_) {}
+        return this;
+      }
+      if (!this._regressions[mode]) throw new Error('[webgazer-aac] unknown regression: ' + mode);
+      this._currentMode = mode;
+      this._regression = this._regressions[mode];
       return this;
     },
+    getRegressionMode() { return this._currentMode; },
 
-    /**
-     * Build a serialisable snapshot of all calibration state.
-     * @returns {object} snapshot ready for CalibrationStore.save()
-     */
+    enableAdaptiveRecalibration() { this._initModels(); this._recalibrator.enable(); return this; },
+    disableAdaptiveRecalibration() { this._initModels(); this._recalibrator.disable(); return this; },
+
+    recordConfirmedSelection(element, options) {
+      this._initModels();
+      options = options || {};
+      const anchor = targetAnchor(element);
+      const normalized = options.normalized || this._lastNormalized;
+      if (!anchor || !normalized || !this._recalibrator) return false;
+      const source = options.source || 'dwell-selection';
+      const weight = options.evidenceWeight == null ? (EVIDENCE_WEIGHTS[source] || EVIDENCE_WEIGHTS['dwell-selection']) : options.evidenceWeight;
+      return this._recalibrator.recordNormalized(normalized, anchor.x, anchor.y, weight, source);
+    },
+    recordDwellHit(element, options) { return this.recordConfirmedSelection(element, Object.assign({ source: 'dwell-selection' }, options || {})); },
+    recordDwellHitXY(x, y, options) {
+      this._initModels();
+      options = options || {};
+      const normalized = options.normalized || this._lastNormalized;
+      if (!normalized) return false;
+      const source = options.source || 'inferred';
+      const weight = options.evidenceWeight == null ? (EVIDENCE_WEIGHTS[source] || EVIDENCE_WEIGHTS.inferred) : options.evidenceWeight;
+      if (this._recalibrator && this._recalibrator.enabled) return this._recalibrator.recordNormalized(normalized, x, y, weight, source);
+      return this.recordGroundTruth(x, y, { normalized, source, evidenceWeight: weight, includeInCalibration: false, adaptive: true });
+    },
+
+    createTargetResolver(options) { return new GazeTargetResolver(options); },
+    resolveTarget(x, y, root) { this._initModels(); return this._targetResolver.resolve(x, y, root); },
+    createDwellTimer(options) {
+      this._initModels();
+      return new DwellTimer(Object.assign({}, options || {}, { aacRef: this, resolver: (options && options.resolver) || this._targetResolver }));
+    },
+
+    enableDriftWatchdog(options) {
+      this._initModels();
+      if (options) {
+        for (const k of ['warnThreshold','critThreshold','minEvidence','decay','onWarn','onCritical']) if (options[k] != null) this._watchdog[k] = options[k];
+      }
+      this._watchdog.enable(); return this;
+    },
+    disableDriftWatchdog() { this._initModels(); this._watchdog.disable(); return this; },
+    resetDriftWatchdog() { this._initModels(); this._watchdog.reset(); return this; },
+    getDriftRmse() { this._initModels(); return this._watchdog.rmse || 0; },
+
+    setKalmanParams(processNoise, measurementNoise) {
+      this._initModels();
+      if (processNoise != null) this._kalman.Q = processNoise;
+      if (measurementNoise != null) this._kalman.R = measurementNoise;
+      return this;
+    },
+    resetSmoother() { this._initModels(); this._kalman.reset(); this._lastResult = null; return this; },
+    getTrackingQuality() { return this._trackingQuality; },
+    getConfidence() { return this._trackingQuality; },
+
+    configureStore(options) { this._store = new CalibrationStore(options || {}); return this; },
     getCalibrationSnapshot() {
-      const snap = {
-        aacVersion:   '1.3.0',
-        timestamp:    Date.now(),
-        screenWidth:  typeof window !== 'undefined' ? window.innerWidth  : 0,
-        screenHeight: typeof window !== 'undefined' ? window.innerHeight : 0,
+      this._initModels();
+      return {
+        libraryVersion: LIBRARY_VERSION,
+        schemaVersion: SCHEMA_VERSION,
+        featureVersion: FEATURE_VERSION,
+        timestamp: Date.now(),
+        viewport: { width: viewportWidth(), height: viewportHeight(), dpr: devicePixelRatio() },
         kalman: { Q: this._kalman.Q, R: this._kalman.R },
-        regressions:  {},
         pca: {
-          left:  LEFT_PCA.fitted  ? { mean: Array.from(LEFT_PCA.mean),  basis: LEFT_PCA.basis,  fitted: true  } : { fitted: false },
-          right: RIGHT_PCA.fitted ? { mean: Array.from(RIGHT_PCA.mean), basis: RIGHT_PCA.basis, fitted: true  } : { fitted: false },
+          left: LEFT_PCA.fitted ? { fitted: true, mean: Array.from(LEFT_PCA.mean), basis: LEFT_PCA.basis } : { fitted: false },
+          right: RIGHT_PCA.fitted ? { fitted: true, mean: Array.from(RIGHT_PCA.mean), basis: RIGHT_PCA.basis } : { fitted: false },
+        },
+        regressions: {
+          polynomial: this._regressions.polynomial.getData(),
+          rbf: this._regressions.rbf.getData(),
         },
       };
-      // Collect data from all named regressions (avoid double-saving shared refs)
-      const saved = new Set();
-      for (const [name, reg] of Object.entries(this._regressions || {})) {
-        // EnsembleRegression delegates to poly/rbf — save those by their own name
-        if (reg instanceof EnsembleRegression) continue;
-        if (saved.has(reg)) continue;
-        saved.add(reg);
-        snap.regressions[name] = reg.getData();
-      }
-      return snap;
     },
-
-    /**
-     * Restore calibration from a snapshot object.
-     * Called automatically by loadCalibration(); you can also call it manually.
-     * @param {object} snapshot
-     */
     applyCalibrationSnapshot(snapshot) {
-      if (!snapshot || snapshot.aacVersion !== '1.3.0') return false;
-
-      // Kalman params
-      if (snapshot.kalman) {
-        if (snapshot.kalman.Q != null) this._kalman.Q = snapshot.kalman.Q;
-        if (snapshot.kalman.R != null) this._kalman.R = snapshot.kalman.R;
+      this._initModels();
+      if (!snapshot || snapshot.schemaVersion !== SCHEMA_VERSION || snapshot.featureVersion !== FEATURE_VERSION) return false;
+      if (snapshot.kalman) { if (snapshot.kalman.Q != null) this._kalman.Q = snapshot.kalman.Q; if (snapshot.kalman.R != null) this._kalman.R = snapshot.kalman.R; }
+      if (snapshot.pca && snapshot.pca.left && snapshot.pca.left.fitted) {
+        LEFT_PCA.mean = Float64Array.from(snapshot.pca.left.mean || []); LEFT_PCA.basis = snapshot.pca.left.basis || LEFT_PCA.basis; LEFT_PCA.fitted = true;
       }
-
-      // PCA bases
-      if (snapshot.pca) {
-        if (snapshot.pca.left && snapshot.pca.left.fitted) {
-          LEFT_PCA.mean   = new Float64Array(snapshot.pca.left.mean);
-          LEFT_PCA.basis  = snapshot.pca.left.basis;
-          LEFT_PCA.fitted = true;
-        }
-        if (snapshot.pca.right && snapshot.pca.right.fitted) {
-          RIGHT_PCA.mean   = new Float64Array(snapshot.pca.right.mean);
-          RIGHT_PCA.basis  = snapshot.pca.right.basis;
-          RIGHT_PCA.fitted = true;
-        }
+      if (snapshot.pca && snapshot.pca.right && snapshot.pca.right.fitted) {
+        RIGHT_PCA.mean = Float64Array.from(snapshot.pca.right.mean || []); RIGHT_PCA.basis = snapshot.pca.right.basis || RIGHT_PCA.basis; RIGHT_PCA.fitted = true;
       }
-
-      // Regression datasets
-      if (snapshot.regressions && this._regressions) {
-        for (const [name, data] of Object.entries(snapshot.regressions)) {
-          const reg = this._regressions[name];
-          if (reg && typeof reg.setData === 'function') reg.setData(data);
-        }
-        // Mark everything dirty so models re-fit on next predict()
-        for (const reg of Object.values(this._regressions)) {
-          if (reg && reg._dirty !== undefined) reg._dirty = true;
-          if (reg instanceof EnsembleRegression) {
-            if (reg.poly) reg.poly._dirty = true;
-            if (reg.rbf)  reg.rbf._dirty  = true;
-          }
-        }
+      if (snapshot.regressions) {
+        this._regressions.polynomial.setData(snapshot.regressions.polynomial || []);
+        this._regressions.rbf.setData(snapshot.regressions.rbf || []);
       }
-
-      console.info('[webgazer-aac] calibration snapshot applied' +
-        (snapshot._screenMismatch ? ' (⚠ screen size mismatch)' : ''));
+      this._trainingRecords = [];
+      this._calibrationRecords = [];
       return true;
     },
-
-    /**
-     * Save current calibration to IndexedDB.
-     * @param {object} [storeOptions] — optional { profileKey, dbName, ... }
-     * @returns {Promise<boolean>}
-     */
     saveCalibration(storeOptions) {
       if (storeOptions) this.configureStore(storeOptions);
       if (!this._store) this._store = new CalibrationStore();
-      const snap = this.getCalibrationSnapshot();
-      return this._store.save(snap).catch(e => {
-        console.warn('[webgazer-aac] saveCalibration failed:', e);
-        return false;
-      });
+      return this._store.save(this.getCalibrationSnapshot()).catch(() => false);
     },
-
-    /**
-     * Load calibration from IndexedDB and apply it.
-     * Returns the snapshot (with _screenMismatch flag if applicable) or null.
-     * @param {object} [storeOptions]
-     * @returns {Promise<object|null>}
-     */
     loadCalibration(storeOptions) {
       if (storeOptions) this.configureStore(storeOptions);
       if (!this._store) this._store = new CalibrationStore();
       return this._store.load().then(snap => {
-        if (!snap) return null;
+        if (!snap || snap._incompatibleReason || snap._validationRequired) return snap;
         this.applyCalibrationSnapshot(snap);
         return snap;
-      }).catch(e => {
-        console.warn('[webgazer-aac] loadCalibration failed:', e);
-        return null;
-      });
+      }).catch(() => null);
     },
+    clearCalibration() { if (!this._store) this._store = new CalibrationStore(); return this._store.clear().catch(() => false); },
+    isStorageAvailable() { if (!this._store) this._store = new CalibrationStore(); return this._store.available(); },
 
-    /**
-     * Clear stored calibration from IndexedDB.
-     * @returns {Promise<boolean>}
-     */
-    clearCalibration() {
-      if (!this._store) this._store = new CalibrationStore();
-      return this._store.clear().catch(e => {
-        console.warn('[webgazer-aac] clearCalibration failed:', e);
-        return false;
-      });
+    attachVideoClock(video) {
+      this.detachVideoClock();
+      if (!video || typeof video.requestVideoFrameCallback !== 'function') return false;
+      const state = { video, active: true, handle: null };
+      const tick = (_now, metadata) => {
+        if (!state.active) return;
+        this._diagnostics.videoFrames++;
+        this._diagnostics.lastVideoMetadata = metadata ? {
+          mediaTime: metadata.mediaTime, presentedFrames: metadata.presentedFrames,
+          expectedDisplayTime: metadata.expectedDisplayTime, processingDuration: metadata.processingDuration,
+        } : null;
+        state.handle = video.requestVideoFrameCallback(tick);
+      };
+      state.handle = video.requestVideoFrameCallback(tick);
+      this._videoClock = state;
+      return true;
     },
-
-    /** Check whether IndexedDB is available in the current context. */
-    isStorageAvailable() {
-      if (!this._store) this._store = new CalibrationStore();
-      return this._store.available();
-    },
-
-    recordDwellHit(element) {
-      if (!this._recalibrator || !this._lastPatches) return;
-      this._recalibrator.recordElementHit(element, this._lastPatches);
-      // Drift watchdog uses dwell hits as ground-truth signal too
-      if (this._watchdog && element) {
-        try {
-          const r = element.getBoundingClientRect();
-          this._watchdog.record(this._lastPatches, r.left + r.width / 2, r.top + r.height / 2);
-        } catch (e) {}
+    detachVideoClock() {
+      const s = this._videoClock;
+      if (!s) return this;
+      s.active = false;
+      if (s.handle != null && s.video && typeof s.video.cancelVideoFrameCallback === 'function') {
+        try { s.video.cancelVideoFrameCallback(s.handle); } catch (_) {}
       }
-    },
-
-    recordDwellHitXY(x, y) {
-      if (!this._recalibrator || !this._lastPatches) return;
-      this._recalibrator.recordHit(x, y, this._lastPatches);
-      // Drift watchdog
-      if (this._watchdog) {
-        try { this._watchdog.record(this._lastPatches, x, y); } catch (e) {}
-      }
-    },
-
-    /**
-     * Tune the Kalman filter's noise parameters.
-     * processNoise: larger = more responsive to movement (default 8)
-     * measurementNoise: larger = smoother but slower (default 50)
-     */
-    setKalmanParams(processNoise, measurementNoise) {
-      this._kalman.Q = processNoise;
-      this._kalman.R = measurementNoise;
+      this._videoClock = null;
       return this;
     },
 
-    getConfidence()     { return this._lastConfidence; },
-    getRegressionMode() { return this._currentMode; },
-    isPCAFitted()       { return LEFT_PCA.fitted && RIGHT_PCA.fitted; },
-
-    resetSmoother() {
-      this._kalman.reset();
-      this._lastResult = null;
-      return this;
+    getDiagnostics() {
+      this._initModels();
+      const d = this._diagnostics;
+      const elapsed = d.firstFrameAt && d.lastFrameAt > d.firstFrameAt ? (d.lastFrameAt - d.firstFrameAt) / 1000 : 0;
+      return {
+        version: LIBRARY_VERSION,
+        libraryVersion: LIBRARY_VERSION,
+        schemaVersion: SCHEMA_VERSION,
+        featureVersion: FEATURE_VERSION,
+        regressionMode: this._currentMode,
+        pcaFitted: this.isPCAFitted(),
+        trackingQuality: this._trackingQuality,
+        gazeStability: this._gazeStability,
+        driftRmse: this._watchdog.rmse || 0,
+        driftState: this._watchdog.state || 'ok',
+        gazeFrames: d.frames,
+        effectiveGazeFps: elapsed > 0 ? d.frames / elapsed : 0,
+        eyeFeatureCoverage: d.frames ? d.eyeFeatureFrames / d.frames : 0,
+        fallbackFrames: d.fallbackFrames,
+        blinkFrames: d.blinkFrames,
+        saccadeFrames: d.saccadeFrames,
+        explicitSamples: d.explicitSamples,
+        adaptiveSamples: d.adaptiveSamples,
+        calibrationSamples: d.calibrationSamples,
+        videoFrames: d.videoFrames,
+        lastVideoMetadata: d.lastVideoMetadata,
+      };
     },
 
-    // Expose classes for testing / advanced use
+    PCABasis,
     PolynomialRegression,
     RBFRegression,
     EnsembleRegression,
     KalmanFilter,
     BlinkDetector,
     SaccadeDetector,
-    FrameCache,
-    AdaptiveRecalibrator,
-    PCABasis,
     DriftWatchdog,
+    AdaptiveRecalibrator,
+    GazeTargetResolver,
+    AdaptiveDwellController,
     DwellTimer,
     CalibrationStore,
     _MemoryBackend,
-
-    version: '1.3.0',
   };
 
-  global.webgazerAAC = webgazerAAC;
-
-})(typeof globalThis !== 'undefined' ? globalThis : window);
+  api._initModels();
+  return api;
+});
