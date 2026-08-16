@@ -22,6 +22,56 @@ function runtimeStatus() {
 }
 runtimeStatus();
 
+function finishWebGazerLoad(source) {
+  if (!window.webgazer) throw new Error('Loaded script did not expose window.webgazer');
+  const version = window.webgazer.version || 'unknown';
+  const matchesExpected = version === '3.5.3';
+  $('wgStatus').textContent = matchesExpected ? version : `${version} (expected 3.5.3)`;
+  $('startBtn').disabled = false;
+  $('useCodespaceBtn').disabled = true;
+  record('webgazer-loaded', { version, expected: '3.5.3', matchesExpected, source });
+}
+
+async function loadScriptUrl(url, source) {
+  if (state.started) return record('load-refused', { reason: 'stop-session-first' });
+  $('wgStatus').textContent = 'loading…';
+  try {
+    const script = document.createElement('script');
+    script.src = `${url}?t=${Date.now()}`;
+    script.async = true;
+    const done = new Promise((resolve, reject) => {
+      script.onload = resolve;
+      script.onerror = () => reject(new Error(`Could not load ${url}`));
+    });
+    document.head.appendChild(script);
+    await done;
+    finishWebGazerLoad(source);
+  } catch (error) {
+    $('wgStatus').textContent = 'load failed';
+    $('useCodespaceBtn').disabled = false;
+    record('webgazer-load-error', { message: String(error.message || error), source });
+  }
+}
+
+async function checkCodespaceBuild() {
+  try {
+    const response = await fetch('/__webgazer__/status', { cache: 'no-store' });
+    const status = await response.json();
+    $('useCodespaceBtn').disabled = !status.available;
+    if (status.available) {
+      record('codespace-webgazer-available', { expectedVersion: status.expectedVersion, source: status.source });
+    } else {
+      record('codespace-webgazer-missing', status);
+    }
+  } catch (error) {
+    $('useCodespaceBtn').disabled = true;
+    record('codespace-webgazer-status-error', { message: String(error.message || error) });
+  }
+}
+checkCodespaceBuild();
+
+$('useCodespaceBtn').addEventListener('click', () => loadScriptUrl('/__webgazer__/webgazer.js', 'codespace-build'));
+
 const points = [
   [0.1,0.12],[0.5,0.12],[0.9,0.12],
   [0.1,0.5],[0.5,0.5],[0.9,0.5],
@@ -57,14 +107,10 @@ $('wgFile').addEventListener('change', async event => {
     const script = document.createElement('script');
     script.textContent = source;
     document.head.appendChild(script);
-    if (!window.webgazer) throw new Error('Selected file did not expose window.webgazer');
-    const version = window.webgazer.version || 'unknown';
-    $('wgStatus').textContent = version;
-    $('startBtn').disabled = false;
-    record('webgazer-loaded', { version, expected: '3.5.3', matchesExpected: version === '3.5.3' });
+    finishWebGazerLoad('uploaded-file');
   } catch (error) {
     $('wgStatus').textContent = 'load failed';
-    record('webgazer-load-error', { message: String(error.message || error) });
+    record('webgazer-load-error', { message: String(error.message || error), source: 'uploaded-file' });
   }
 });
 
