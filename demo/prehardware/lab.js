@@ -1,7 +1,7 @@
 'use strict';
 
 const $ = id => document.getElementById(id);
-const state = { started: false, events: [], dwell: null, lastResolved: null, timer: null };
+const state = { started: false, events: [], dwell: null, lastResolved: null, timer: null, webgazerIdentity: null, codespaceMeta: null };
 const logEl = $('log');
 const board = $('aacBoard');
 const gazeDot = $('gazeDot');
@@ -22,17 +22,40 @@ function runtimeStatus() {
 }
 runtimeStatus();
 
-function finishWebGazerLoad(source) {
+function finishWebGazerLoad(source, identity = null) {
   if (!window.webgazer) throw new Error('Loaded script did not expose window.webgazer');
-  const version = window.webgazer.version || 'unknown';
-  const matchesExpected = version === '3.5.3';
-  $('wgStatus').textContent = matchesExpected ? version : `${version} (expected 3.5.3)`;
+
+  let version = null;
+  let verified = false;
+  let bundleSha256 = null;
+  let bundleBytes = null;
+
+  if (identity && identity.identityVerified) {
+    version = identity.version;
+    verified = version === '3.5.3';
+    bundleSha256 = identity.bundleSha256 || null;
+    bundleBytes = identity.bundleBytes || null;
+  } else {
+    version = window.webgazer.version || 'unknown';
+    verified = version === '3.5.3';
+  }
+
+  state.webgazerIdentity = {
+    source,
+    version,
+    expectedVersion: '3.5.3',
+    verified,
+    bundleSha256,
+    bundleBytes,
+  };
+
+  $('wgStatus').textContent = verified ? `${version} verified` : `${version} (expected 3.5.3)`;
   $('startBtn').disabled = false;
   $('useCodespaceBtn').disabled = true;
-  record('webgazer-loaded', { version, expected: '3.5.3', matchesExpected, source });
+  record('webgazer-loaded', state.webgazerIdentity);
 }
 
-async function loadScriptUrl(url, source) {
+async function loadScriptUrl(url, source, identity = null) {
   if (state.started) return record('load-refused', { reason: 'stop-session-first' });
   $('wgStatus').textContent = 'loading…';
   try {
@@ -45,10 +68,10 @@ async function loadScriptUrl(url, source) {
     });
     document.head.appendChild(script);
     await done;
-    finishWebGazerLoad(source);
+    finishWebGazerLoad(source, identity);
   } catch (error) {
     $('wgStatus').textContent = 'load failed';
-    $('useCodespaceBtn').disabled = false;
+    $('useCodespaceBtn').disabled = !(state.codespaceMeta && state.codespaceMeta.identityVerified);
     record('webgazer-load-error', { message: String(error.message || error), source });
   }
 }
@@ -57,20 +80,33 @@ async function checkCodespaceBuild() {
   try {
     const response = await fetch('/__webgazer__/status', { cache: 'no-store' });
     const status = await response.json();
-    $('useCodespaceBtn').disabled = !status.available;
-    if (status.available) {
-      record('codespace-webgazer-available', { expectedVersion: status.expectedVersion, source: status.source });
+    state.codespaceMeta = status;
+    $('useCodespaceBtn').disabled = !status.identityVerified;
+    if (status.identityVerified) {
+      record('codespace-webgazer-verified', {
+        version: status.version,
+        expectedVersion: status.expectedVersion,
+        bundleSha256: status.bundleSha256,
+        bundleBytes: status.bundleBytes,
+        source: status.source,
+      });
     } else {
-      record('codespace-webgazer-missing', status);
+      record('codespace-webgazer-unverified', status);
     }
   } catch (error) {
+    state.codespaceMeta = null;
     $('useCodespaceBtn').disabled = true;
     record('codespace-webgazer-status-error', { message: String(error.message || error) });
   }
 }
 checkCodespaceBuild();
 
-$('useCodespaceBtn').addEventListener('click', () => loadScriptUrl('/__webgazer__/webgazer.js', 'codespace-build'));
+$('useCodespaceBtn').addEventListener('click', () => {
+  if (!state.codespaceMeta || !state.codespaceMeta.identityVerified) {
+    return record('load-refused', { reason: 'codespace-webgazer-not-verified' });
+  }
+  loadScriptUrl('/__webgazer__/webgazer.js', 'codespace-build', state.codespaceMeta);
+});
 
 const points = [
   [0.1,0.12],[0.5,0.12],[0.9,0.12],
@@ -163,7 +199,7 @@ $('startBtn').addEventListener('click', async () => {
     $('stopBtn').disabled = false;
     $('wgFile').disabled = true;
     setSession('running');
-    record('session-start', { runtime: window.webgazerAAC.version, webgazer: window.webgazer.version || 'unknown' });
+    record('session-start', { runtime: window.webgazerAAC.version, webgazerIdentity: state.webgazerIdentity });
     state.timer = setInterval(updateDiagnostics, 250);
   } catch (error) {
     record('session-start-error', { message: String(error.message || error) });
@@ -217,7 +253,7 @@ $('downloadBtn').addEventListener('click', () => {
     schema: 'webgazer-aac/browser-lab-evidence/0.1',
     exportedAt: new Date().toISOString(),
     runtimeVersion: window.webgazerAAC && window.webgazerAAC.version,
-    webgazerVersion: window.webgazer && window.webgazer.version || null,
+    webgazerIdentity: state.webgazerIdentity,
     diagnostics: window.webgazerAAC && window.webgazerAAC.getDiagnostics(),
     assurance: window.webgazerAAC && window.webgazerAAC.getAssuranceSnapshot && window.webgazerAAC.getAssuranceSnapshot(),
     lineage: window.webgazerAAC && window.webgazerAAC.getEvidenceLineage ? window.webgazerAAC.getEvidenceLineage() : [],
