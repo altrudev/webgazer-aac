@@ -98,7 +98,25 @@
   <script src="./assurance-guard.js"></script>
   <script src="./lab.js"></script>
   <script src="./camera-quality.js"></script>
-  <script src="./capture-fusion.js"></script>
   <script src="./eye-motion.js"></script>
+  <script>
+    (() => {
+      let fusionLoaded = false;
+      const session = document.getElementById('sessionState');
+      const loadFusion = () => {
+        if (fusionLoaded || !session || session.textContent.trim().toLowerCase() !== 'running') return;
+        fusionLoaded = true;
+        const script = document.createElement('script');
+        script.src = `./capture-fusion.js?t=${Date.now()}`;
+        script.async = true;
+        script.dataset.deferredUntilSessionRunning = 'true';
+        document.body.appendChild(script);
+      };
+      if (session) {
+        new MutationObserver(loadFusion).observe(session, { childList: true, characterData: true, subtree: true });
+      }
+      loadFusion();
+    })();
+  </script>
 </body>
 </html>
