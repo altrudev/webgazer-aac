@@ -10,6 +10,7 @@
     adaptiveActivated: false,
     driftActivated: false,
     blockedDwellUpdates: 0,
+    sessionFitAuthorized: false,
   };
 
   const originalEnableAdaptive = typeof aac.enableAdaptiveRecalibration === 'function'
@@ -20,14 +21,20 @@
     ? aac.fitUserBasis.bind(aac) : null;
   const originalCreateDwell = typeof aac.createDwellTimer === 'function'
     ? aac.createDwellTimer.bind(aac) : null;
+  const originalClear = typeof aac.clearAllCalibration === 'function'
+    ? aac.clearAllCalibration.bind(aac) : null;
 
   function fitted() {
     try { return !!(aac.isPCAFitted && aac.isPCAFitted()); }
     catch (_) { return false; }
   }
 
+  function authorized() {
+    return state.sessionFitAuthorized && fitted();
+  }
+
   function activatePostCalibration() {
-    if (!fitted()) return false;
+    if (!authorized()) return false;
     if (state.adaptiveRequested && originalEnableAdaptive && !state.adaptiveActivated) {
       originalEnableAdaptive();
       state.adaptiveActivated = true;
@@ -58,8 +65,18 @@
   if (originalFit) {
     aac.fitUserBasis = function (...args) {
       const result = originalFit(...args);
-      if (result && result.rebuilt && fitted()) activatePostCalibration();
+      state.sessionFitAuthorized = !!(result && result.rebuilt && fitted());
+      if (state.sessionFitAuthorized) activatePostCalibration();
       return result;
+    };
+  }
+
+  if (originalClear) {
+    aac.clearAllCalibration = async function (...args) {
+      state.sessionFitAuthorized = false;
+      state.adaptiveActivated = false;
+      state.driftActivated = false;
+      return originalClear(...args);
     };
   }
 
@@ -69,7 +86,7 @@
       if (!timer || typeof timer.updateFromGaze !== 'function') return timer;
       const originalUpdate = timer.updateFromGaze.bind(timer);
       timer.updateFromGaze = function (...updateArgs) {
-        if (!fitted()) {
+        if (!authorized()) {
           state.blockedDwellUpdates++;
           return null;
         }
@@ -82,8 +99,9 @@
 
   aac.__assuranceGuardInstalled = true;
   window.webgazerAACAssuranceGuard = {
-    version: '0.1',
+    version: '0.2',
     isPCAFitted: fitted,
-    getState: () => ({ ...state, pcaFitted: fitted() }),
+    isSessionFitAuthorized: authorized,
+    getState: () => ({ ...state, pcaFitted: fitted(), sessionAuthorized: authorized() }),
   };
 })();
