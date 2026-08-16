@@ -1,0 +1,10 @@
+{
+  "name": "webgazer-aac",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Local-first AAC reliability and gaze interaction layer for WebGazer.js",
+  "license": "GPL-3.0-only",
+  "scripts": {
+    "test": "node test/webgazer-aac.test.js"
+  }
+}
