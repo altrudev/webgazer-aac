@@ -1,0 +1,39 @@
+{
+  "schema": "webgazer-aac/pre-hardware-validation/0.1",
+  "observedAt": "2026-08-16T17:50:00Z",
+  "candidate": {
+    "file": "webgazer-aac.js",
+    "version": "2.0.0",
+    "sha256": "b72ce6170826ab56c78b9afa716c05faaf743b4755a76bbc4b969a9900ec1770"
+  },
+  "environment": {
+    "node": "v22.16.0",
+    "networkUsedByRuntime": false,
+    "hardwareWebcamUsed": false,
+    "browserUsed": false
+  },
+  "result": {
+    "status": "pass",
+    "checksPassed": 80,
+    "checksFailed": 0,
+    "suites": [
+      {"id":"core-invariants","passed":22,"failed":0},
+      {"id":"integration-audit","passed":10,"failed":0},
+      {"id":"ddc-pre-hardware-assurance","passed":38,"failed":0},
+      {"id":"bounded-long-session","passed":10,"failed":0,"simulatedGazeFrames":20000}
+    ]
+  },
+  "evidenceClass": "observed",
+  "authority": {
+    "ddcPlatformProviderExecuted": false,
+    "ddcRouterRunRecorded": false,
+    "claim": "Local deterministic pre-hardware reproduction only"
+  },
+  "remainingGates": [
+    "DDC Platform staging/routing run when an executable DDC environment is available",
+    "real browser and webcam validation",
+    "representative AAC board interaction validation",
+    "held-out performance measurement",
+    "human-factors validation"
+  ]
+}
