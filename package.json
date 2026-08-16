@@ -5,6 +5,8 @@
   "description": "Local-first AAC reliability and gaze interaction layer for WebGazer.js",
   "license": "GPL-3.0-only",
   "scripts": {
-    "test": "node test/webgazer-aac.test.js && node test/integration.test.js"
+    "promote:verified": "node scripts/materialize-verified-candidate.mjs",
+    "test": "node test/webgazer-aac.test.js && node test/integration.test.js && node test/ddc-assurance.test.js && node test/long-session.test.js",
+    "gate:prehardware": "npm run promote:verified && npm test"
   }
 }
