@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>webgazer-aac v2 Pre-Hardware Lab</title>
+  <link rel="stylesheet" href="./lab.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <p class="eyebrow">DDC PRE-HARDWARE LAB</p>
+        <h1>webgazer-aac v2</h1>
+        <p class="sub">Local browser validation. No target action is executed by gaze; dwell completion is evidence only.</p>
+      </div>
+      <div id="runtimeBadge" class="badge">runtime loading…</div>
+    </header>
+
+    <section class="controls" aria-label="Lab controls">
+      <label class="fileButton">Load local WebGazer 3.5.3
+        <input id="wgFile" type="file" accept=".js,text/javascript">
+      </label>
+      <button id="startBtn" disabled>Start camera</button>
+      <button id="stopBtn" disabled>Stop</button>
+      <button id="resetBtn">Clear calibration</button>
+      <button id="downloadBtn">Download evidence</button>
+    </section>
+
+    <section class="statusGrid" aria-label="Live status">
+      <article><span>WebGazer</span><strong id="wgStatus">not loaded</strong></article>
+      <article><span>Tracking quality</span><strong id="quality">0.00</strong></article>
+      <article><span>Target confidence</span><strong id="targetConfidence">0.00</strong></article>
+      <article><span>Drift RMSE</span><strong id="drift">0</strong></article>
+      <article><span>Gaze FPS</span><strong id="fps">0</strong></article>
+      <article><span>Eye features</span><strong id="coverage">0%</strong></article>
+    </section>
+
+    <section class="workspace">
+      <article class="panel calibrationPanel">
+        <div class="panelHead">
+          <div><p class="eyebrow">CALIBRATION</p><h2>Look, then click each point</h2></div>
+          <button id="fitBtn" disabled>Fit user basis</button>
+        </div>
+        <div id="calibrationGrid" class="calibrationGrid" aria-label="Calibration targets"></div>
+        <p id="calibrationStatus" class="hint">Load WebGazer and start the camera first.</p>
+      </article>
+
+      <article class="panel aacPanel">
+        <div class="panelHead">
+          <div><p class="eyebrow">AAC TARGET RESOLUTION</p><h2>Evidence-only dwell board</h2></div>
+          <strong id="lastSelection">No selection</strong>
+        </div>
+        <div id="aacBoard" class="aacBoard">
+          <button data-gaze-target>YES</button>
+          <button data-gaze-target>NO</button>
+          <button data-gaze-target>HELP</button>
+          <button data-gaze-target>DRINK</button>
+          <button data-gaze-target>FOOD</button>
+          <button data-gaze-target>PAIN</button>
+          <button data-gaze-target>MORE</button>
+          <button data-gaze-target>STOP</button>
+          <button data-gaze-target>THANK YOU</button>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel evidencePanel">
+      <div class="panelHead"><div><p class="eyebrow">EVIDENCE</p><h2>Session log</h2></div><span id="sessionState">idle</span></div>
+      <pre id="log" aria-live="polite"></pre>
+    </section>
+  </main>
+
+  <div id="gazeDot" class="gazeDot" hidden></div>
+  <script src="../../webgazer-aac.js"></script>
+  <script src="./lab.js"></script>
+</body>
+</html>
