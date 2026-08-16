@@ -10,12 +10,13 @@
       "target": "altrudev/webgazer-aac",
       "branch": "agent/webgazer-aac-v2",
       "upstream": "WebGazer 3.5.3",
-      "candidateArtifact": "local verified hardened candidate for webgazer-aac.js",
-      "candidateState": "local-verified-unpromoted",
-      "candidateSha256": "b72ce6170826ab56c78b9afa716c05faaf743b4755a76bbc4b969a9900ec1770",
-      "candidateGitBlobExpected": "5fbf87f39cd68ac0a4b1f05ef3cd64c3d44f97b6",
-      "repositoryRuntimeGitBlobAtObservation": "471e37e4dcd0dff4c7fa20f1e81e8aac4b29463c",
-      "promotionRule": "The hardened candidate must not replace the repository runtime unless the promoted bytes reproduce the declared SHA-256/Git blob identity.",
+      "candidateArtifact": "ddc/candidate/webgazer-aac.compact.js.gz.b64",
+      "candidateState": "repository-packaged-verified-materializable",
+      "candidateSha256": "e2049bad33eb37a6bfeb375490455d78a33d8cb31bb16339fa2cabf02715f5e1",
+      "candidateGitBlobExpected": "2b98d877627af794f507cf1d7911a456135f0d82",
+      "candidateBytes": 51666,
+      "materializer": "scripts/materialize-verified-candidate.mjs",
+      "promotionRule": "Materialization must reproduce the declared SHA-256, Git blob and byte count before webgazer-aac.js can inherit validation authority.",
       "assuranceContract": "ddc/pre-hardware-assurance.json",
       "adapterContract": "ddc/product-adapter.json"
     }
@@ -24,9 +25,10 @@
   "details": {
     "phase":"pre-hardware-beta",
     "intent":"Verify authority, evidence, privacy, reversibility and bounded-resource invariants before real browser/webcam/AAC-board testing.",
-    "nonClaims":["No clinical validation","No medical-device claim","No measured real-world accuracy improvement","No claim that DDC providers executed unless a DDC Run records that execution","No claim that the repository root runtime already contains the locally verified hardening candidate"]
+    "nonClaims":["No clinical validation","No medical-device claim","No measured real-world accuracy improvement","No claim that DDC providers executed unless a DDC Run records that execution"]
   },
   "successCriteria": [
+    "Verified candidate materializes only when artifact identity matches",
     "Canonical unit/integration suites remain green",
     "DDC authority and evidence invariants remain green",
     "Persisted calibration excludes raw eye material",
@@ -35,13 +37,12 @@
     "Full calibration clearing removes persistent and in-memory calibration evidence",
     "Polynomial, RBF, calibration and evidence-lineage retention remain within declared bounds",
     "20,000-frame bounded-session simulation completes without exception",
-    "Gaze runtime does not directly invoke target click authority",
-    "Promotion is rejected when candidate identity cannot be preserved exactly"
+    "Gaze runtime does not directly invoke target click authority"
   ],
   "epistemicIntegrity": {
     "schema":"ddc-platform/epistemic-integrity/0.1",
     "mode":"high-assurance",
-    "methodology":"Reproduction against machine-readable transition invariants with explicit observed/declared/inferred separation and fail-closed authority assumptions.",
+    "methodology":"Reproduction against machine-readable transition invariants with explicit observed/declared/inferred separation and artifact-bound validation.",
     "sourceClasses":["repository-source","runtime-test-output","ddc-contract","upstream-contract"],
     "minimumIndependentSources":2,
     "freshnessDays":30,
@@ -65,12 +66,11 @@
   },
   "operationCapabilities": [
     {"id":"prehardware-observe","class":"observe","actions":["inspect-source","read-contracts","collect-test-evidence"],"resources":["repository","test-output","ddc-contract"],"scope":["webgazer-aac-v2"],"external":false},
-    {"id":"prehardware-simulate","class":"simulate","actions":["run-unit-tests","run-integration-tests","run-ddc-assurance","run-bounded-long-session"],"resources":["isolated-node-runtime"],"scope":["webgazer-aac-v2"],"external":false}
+    {"id":"prehardware-simulate","class":"simulate","actions":["materialize-verified-candidate","run-unit-tests","run-integration-tests","run-ddc-assurance","run-bounded-long-session"],"resources":["isolated-node-runtime"],"scope":["webgazer-aac-v2"],"external":false}
   ],
   "authorityWarnings": [
     "A green pre-hardware gate does not authorize real AAC activation or replace human/browser/webcam validation.",
-    "Observed runtime behavior may inform evidence but may not silently broaden action authority.",
-    "The hardened candidate is not repository-promoted until artifact identity is verified after publication."
+    "Observed runtime behavior may inform evidence but may not silently broaden action authority."
   ],
   "environmentProfile":"node24-local-isolated-no-network",
   "outputs":["technical-report","run-json","findings","claim-lineage"],
