@@ -1,0 +1,101 @@
+{
+  "protocol": "ddc-platform/pre-hardware-assurance",
+  "version": "0.1",
+  "schemaStatus": "project-local-v0.1",
+  "target": {
+    "name": "webgazer-aac",
+    "libraryVersion": "2.0.0",
+    "upstream": "WebGazer 3.5.3",
+    "phase": "pre-hardware-beta"
+  },
+  "authority": {
+    "principle": "observation-does-not-imply-authority",
+    "selectionChain": ["gaze-observation", "candidate-target", "stable-intent", "dwell-satisfied", "target-accepted", "action"],
+    "learningChain": ["observation", "provenance-classification", "supervision-weight", "model-transition", "verification", "lineage"],
+    "forbiddenPromotions": [
+      "gaze-observation->action",
+      "predicted-coordinate->ground-truth",
+      "inferred-evidence->observed-evidence",
+      "tracking-quality->target-confidence"
+    ]
+  },
+  "evidence": {
+    "classes": [
+      {"id":"calibration","class":"observed","weight":1.0},
+      {"id":"explicit","class":"observed","weight":1.0},
+      {"id":"confirmed-click","class":"observed","weight":0.85},
+      {"id":"dwell-selection","class":"inferred","weight":0.35},
+      {"id":"inferred","class":"inferred","weight":0.15}
+    ],
+    "requiredLineage": ["source", "observation", "target", "weight", "consumer", "consequence"]
+  },
+  "transitions": [
+    {
+      "id":"frame-to-evidence",
+      "authority":"observe-only",
+      "preconditions":["same-frame-eye-features-or-explicit-fallback"],
+      "transition":"webgazer-frame->normalized-eye-evidence",
+      "affected":["semantic","state","frequency","lineage"],
+      "verification":["eyeFeatures-frame-alignment","fallback-explicit"],
+      "conserved":["authority","privacy","lineage"],
+      "recovery":"discard-invalid-or-stale-evidence"
+    },
+    {
+      "id":"feature-space-transition",
+      "authority":"calibration-only",
+      "preconditions":["sufficient-calibration-evidence"],
+      "transition":"fallback-basis->fitted-user-pca-basis",
+      "affected":["semantic","state","resource","lineage"],
+      "verification":["all-training-vectors-rebuilt"],
+      "conserved":["labels","evidence-provenance","privacy"],
+      "recovery":"reset-calibration-and-rebuild"
+    },
+    {
+      "id":"gaze-to-selection",
+      "authority":"interaction-bounded",
+      "preconditions":["tracking-available","candidate-resolved","dwell-satisfied"],
+      "transition":"gaze-observation->confirmed-target",
+      "affected":["state","authority","consequence","lineage"],
+      "verification":["canonical-target-identity","target-confidence","dwell-completion"],
+      "conserved":["observation-authority-separation","alternative-inputs","reversibility"],
+      "recovery":"cancel-or-correct-selection"
+    },
+    {
+      "id":"selection-to-learning",
+      "authority":"adaptation-bounded",
+      "preconditions":["confirmed-target","current-normalized-evidence"],
+      "transition":"confirmed-target-anchor->weighted-supervision",
+      "affected":["model-state","lineage"],
+      "verification":["provenance-weight-applied","pre-training-drift-evaluated"],
+      "conserved":["prediction-not-ground-truth","privacy"],
+      "recovery":"disable-adaptation-reset-calibration"
+    }
+  ],
+  "failureStates": {
+    "ordered":["tracking","degraded","ambiguous","paused","recovering","validated"],
+    "rule":"degraded evidence may reduce authority; it may never increase authority"
+  },
+  "privacy": {
+    "networkDefault":"deny",
+    "telemetry":"none",
+    "persistRawEyeImages":false,
+    "persistNormalizedEyePatches":false,
+    "persistDerivedCalibrationOnly":true,
+    "clearMustCover":["persistent-calibration","in-memory-calibration-evidence","in-memory-evidence-lineage","transient-eye-evidence"]
+  },
+  "resourceBounds": {
+    "trainingRecordsMax":500,
+    "polynomialSamplesMax":220,
+    "rbfSamplesMax":120,
+    "calibrationRecordsMax":300,
+    "evidenceLineageMax":500,
+    "driftHistoryMustBeBounded":true,
+    "targetQueriesMustBeCachedOrBounded":true,
+    "videoFrameCallbackMustBeDetachable":true,
+    "installMustBeReversible":true
+  },
+  "releaseGate": {
+    "preHardware":["unit-and-integration-green","ddc-contract-green","privacy-green","authority-green","reversibility-green","bounded-long-session-green"],
+    "stillRequiredAfterGate":["real-browser-webcam-validation","representative-aac-board-validation","held-out-performance-measurement","human-factors-validation"]
+  }
+}
