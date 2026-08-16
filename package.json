@@ -6,7 +6,7 @@
   "license": "GPL-3.0-only",
   "scripts": {
     "promote:verified": "node scripts/materialize-verified-candidate.mjs",
-    "test": "npm run promote:verified && node test/webgazer-aac.test.js && node test/integration.test.js && node test/ddc-assurance.test.js && node test/long-session.test.js",
+    "test": "npm run promote:verified && node test/webgazer-aac.test.js && node test/integration.test.js && node test/ddc-assurance.test.js && node test/long-session.test.js && node test/capture-fusion.test.js",
     "gate:prehardware": "npm test",
     "lab:browser": "node scripts/serve-prehardware.mjs"
   }
