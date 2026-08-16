@@ -2,9 +2,12 @@
   "schema": "webgazer-aac/pre-hardware-validation/0.1",
   "observedAt": "2026-08-16T17:50:00Z",
   "candidate": {
-    "file": "webgazer-aac.js",
+    "file": "local hardened candidate for webgazer-aac.js",
     "version": "2.0.0",
-    "sha256": "b72ce6170826ab56c78b9afa716c05faaf743b4755a76bbc4b969a9900ec1770"
+    "state": "local-verified-unpromoted",
+    "sha256": "b72ce6170826ab56c78b9afa716c05faaf743b4755a76bbc4b969a9900ec1770",
+    "expectedGitBlob": "5fbf87f39cd68ac0a4b1f05ef3cd64c3d44f97b6",
+    "repositoryRuntimeGitBlobAtObservation": "471e37e4dcd0dff4c7fa20f1e81e8aac4b29463c"
   },
   "environment": {
     "node": "v22.16.0",
@@ -13,7 +16,7 @@
     "browserUsed": false
   },
   "result": {
-    "status": "pass",
+    "status": "pass-local-candidate",
     "checksPassed": 80,
     "checksFailed": 0,
     "suites": [
@@ -23,6 +26,15 @@
       {"id":"bounded-long-session","passed":10,"failed":0,"simulatedGazeFrames":20000}
     ]
   },
+  "promotionIntegrity": {
+    "status": "blocked-until-exact-artifact-promotion",
+    "rule": "No validation claim transfers to a promoted runtime unless its bytes reproduce the candidate SHA-256/Git blob identity.",
+    "rejectedTransfer": {
+      "gitBlob": "c1fd07d682b0581fcd4dae8129adb6707d2f38a0",
+      "attachedToBranch": false,
+      "reason": "artifact identity mismatch"
+    }
+  },
   "evidenceClass": "observed",
   "authority": {
     "ddcPlatformProviderExecuted": false,
@@ -30,6 +42,8 @@
     "claim": "Local deterministic pre-hardware reproduction only"
   },
   "remainingGates": [
+    "Promote the exact hardened runtime and re-verify artifact identity",
+    "Re-run the 80-check gate against the repository-promoted artifact",
     "DDC Platform staging/routing run when an executable DDC environment is available",
     "real browser and webcam validation",
     "representative AAC board interaction validation",
