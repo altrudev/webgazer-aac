@@ -18,15 +18,14 @@
     </header>
 
     <section class="controls" aria-label="Lab controls">
-      <button id="useCodespaceBtn">Use Codespace WebGazer 3.5.3</button>
-      <label class="fileButton">Load local WebGazer 3.5.3
-        <input id="wgFile" type="file" accept=".js,text/javascript">
-      </label>
+      <button id="useCodespaceBtn">Use verified Codespace WebGazer 3.5.3</button>
+      <input id="wgFile" type="file" accept=".js,text/javascript" hidden disabled aria-hidden="true">
       <button id="startBtn" disabled>Start camera</button>
       <button id="stopBtn" disabled>Stop</button>
       <button id="resetBtn">Clear calibration</button>
       <button id="downloadBtn">Download evidence</button>
     </section>
+    <p class="hint">Assurance mode accepts only the independently verified Codespace WebGazer 3.5.3 artifact. Arbitrary JavaScript upload is disabled.</p>
 
     <section class="statusGrid" aria-label="Live status">
       <article><span>WebGazer</span><strong id="wgStatus">not loaded</strong></article>
@@ -73,6 +72,15 @@
   </main>
 
   <div id="gazeDot" class="gazeDot" hidden></div>
+  <script>
+    // Assurance lab is fail-closed: arbitrary upload is not an authorized evidence source.
+    const assuranceUpload = document.getElementById('wgFile');
+    assuranceUpload.addEventListener('change', event => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      assuranceUpload.value = '';
+    }, true);
+  </script>
   <script src="../../webgazer-aac.js"></script>
   <script src="./lab.js"></script>
 </body>
