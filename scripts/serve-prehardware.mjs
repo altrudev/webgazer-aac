@@ -9,7 +9,19 @@ const types = { '.html':'text/html; charset=utf-8', '.js':'text/javascript; char
 
 const server = http.createServer((req, res) => {
   const raw = decodeURIComponent((req.url || '/').split('?')[0]);
-  const rel = raw === '/' ? 'demo/prehardware/index.html' : raw.replace(/^\/+/, '');
+
+  // Codespaces commonly opens a forwarded port at `/`. Redirect to the
+  // canonical lab path so relative CSS/JS URLs resolve correctly.
+  if (raw === '/') {
+    res.writeHead(302, {
+      'Location': '/demo/prehardware/',
+      'Cache-Control': 'no-store'
+    });
+    res.end();
+    return;
+  }
+
+  const rel = raw.replace(/^\/+/, '');
   const file = path.resolve(root, rel);
   if (file !== root && !file.startsWith(root + path.sep)) {
     res.writeHead(403).end('Forbidden'); return;
