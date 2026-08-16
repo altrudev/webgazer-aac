@@ -16,6 +16,36 @@ function record(type, detail = {}) {
 
 function setSession(text) { $('sessionState').textContent = text; }
 
+function errorEvidence(error) {
+  return {
+    name: error && error.name ? String(error.name) : null,
+    message: String(error && (error.message || error) || 'unknown error'),
+    stack: error && error.stack ? String(error.stack) : null,
+    webgazerReady: !!(window.webgazer && typeof window.webgazer.isReady === 'function' && window.webgazer.isReady()),
+    videoElementPresent: !!document.getElementById('webgazerVideoFeed'),
+    videoContainerPresent: !!document.getElementById('webgazerVideoContainer'),
+  };
+}
+
+async function cleanPartialSession() {
+  clearInterval(state.timer); state.timer = null;
+  try {
+    if (window.webgazer && typeof window.webgazer.stopVideo === 'function') window.webgazer.stopVideo();
+  } catch (_) {}
+  try {
+    if (window.webgazer && typeof window.webgazer.end === 'function') await window.webgazer.end();
+  } catch (_) {}
+  try {
+    if (window.webgazerAAC && window.webgazerAAC._installed) window.webgazerAAC.uninstall();
+  } catch (_) {}
+  state.started = false;
+  state.dwell = null;
+  gazeDot.hidden = true;
+  $('stopBtn').disabled = true;
+  $('startBtn').disabled = !(window.webgazer && state.webgazerIdentity && state.webgazerIdentity.verified);
+  setSession('failed');
+}
+
 function runtimeStatus() {
   const aac = window.webgazerAAC;
   $('runtimeBadge').textContent = aac ? `AAC ${aac.version} · ${aac.featureVersion || aac._featureVersion || 'feature-v2'}` : 'AAC runtime missing';
@@ -67,7 +97,7 @@ async function loadScriptUrl(url, source, identity = null) {
   } catch (error) {
     $('wgStatus').textContent = 'load failed';
     $('useCodespaceBtn').disabled = false;
-    record('webgazer-load-error', { message: String(error.message || error), source });
+    record('webgazer-load-error', { ...errorEvidence(error), source });
   }
 }
 
@@ -97,7 +127,7 @@ async function checkCodespaceBuild() {
   } catch (error) {
     state.webgazerIdentity = null;
     $('useCodespaceBtn').disabled = true;
-    record('codespace-webgazer-status-error', { message: String(error.message || error) });
+    record('codespace-webgazer-status-error', errorEvidence(error));
   }
 }
 checkCodespaceBuild();
@@ -109,7 +139,7 @@ $('useCodespaceBtn').addEventListener('click', async () => {
   } catch (error) {
     $('wgStatus').textContent = 'identity failed';
     $('useCodespaceBtn').disabled = true;
-    record('webgazer-identity-error', { message: String(error.message || error), source: 'codespace-build' });
+    record('webgazer-identity-error', { ...errorEvidence(error), source: 'codespace-build' });
   }
 });
 
@@ -139,20 +169,10 @@ for (const [nx, ny] of points) {
   $('calibrationGrid').appendChild(p);
 }
 
-$('wgFile').addEventListener('change', async event => {
-  const file = event.target.files && event.target.files[0];
-  if (!file) return;
-  if (state.started) return record('load-refused', { reason: 'stop-session-first' });
-  try {
-    const source = await file.text();
-    const script = document.createElement('script');
-    script.textContent = source;
-    document.head.appendChild(script);
-    finishWebGazerLoad('uploaded-file');
-  } catch (error) {
-    $('wgStatus').textContent = 'load failed';
-    record('webgazer-load-error', { message: String(error.message || error), source: 'uploaded-file' });
-  }
+$('wgFile').addEventListener('change', event => {
+  event.preventDefault();
+  event.target.value = '';
+  record('load-refused', { reason: 'arbitrary-upload-disabled-in-assurance-mode' });
 });
 
 function wireBoardEvidence() {
@@ -189,6 +209,7 @@ $('startBtn').addEventListener('click', async () => {
     record('session-start-refused', { reason: 'webgazer-identity-not-verified', identity: state.webgazerIdentity });
     return;
   }
+  setSession('starting');
   try {
     window.webgazerAAC.install().enableAdaptiveRecalibration().enableDriftWatchdog();
     state.dwell = window.webgazerAAC.createDwellTimer({ dwellMs: 800, minTrackingQuality: 0.3, minTargetConfidence: 0.35 });
@@ -202,7 +223,7 @@ $('startBtn').addEventListener('click', async () => {
       $('targetConfidence').textContent = resolved ? resolved.confidence.toFixed(2) : '0.00';
       state.dwell.updateFromGaze(gaze, board);
     });
-    await window.webgazer.begin();
+    await window.webgazer.begin(() => record('webgazer-begin-onfail', { stage: 'camera-or-init' }));
     state.started = true;
     $('startBtn').disabled = true;
     $('stopBtn').disabled = false;
@@ -211,16 +232,19 @@ $('startBtn').addEventListener('click', async () => {
     record('session-start', { runtime: window.webgazerAAC.version, webgazerIdentity: state.webgazerIdentity });
     state.timer = setInterval(updateDiagnostics, 250);
   } catch (error) {
-    record('session-start-error', { message: String(error.message || error) });
+    record('session-start-error', errorEvidence(error));
+    await cleanPartialSession();
   }
 });
 
 async function stopSession() {
   if (!state.started) return;
   clearInterval(state.timer); state.timer = null;
+  try { if (window.webgazer && typeof window.webgazer.stopVideo === 'function') window.webgazer.stopVideo(); } catch (_) {}
   try { if (window.webgazer && typeof window.webgazer.end === 'function') await window.webgazer.end(); } catch (_) {}
   try { window.webgazerAAC.uninstall(); } catch (_) {}
   state.started = false;
+  state.dwell = null;
   gazeDot.hidden = true;
   $('startBtn').disabled = !(window.webgazer && state.webgazerIdentity && state.webgazerIdentity.verified);
   $('stopBtn').disabled = true;
@@ -253,7 +277,7 @@ function updateDiagnostics() {
   const d = window.webgazerAAC.getDiagnostics();
   $('quality').textContent = Number(d.trackingQuality || 0).toFixed(2);
   $('drift').textContent = Number(d.driftRmse || 0).toFixed(1);
-  $('fps').textContent = Number(d.effectiveGazeFps || d.gazeFps || 0).toFixed(1);
+  $('fps').textContent = Number(d.effectiveListenerFps || d.effectiveGazeFps || d.gazeFps || 0).toFixed(1);
   $('coverage').textContent = `${Math.round(Number(d.eyeFeatureCoverage || 0) * 100)}%`;
 }
 
