@@ -9,8 +9,10 @@
     driftRequested: false,
     adaptiveActivated: false,
     driftActivated: false,
+    sessionAuthorizedFit: false,
     blockedDwellUpdates: 0,
-    sessionFitAuthorized: false,
+    blockedForCalibration: 0,
+    blockedForCaptureQuality: 0,
   };
 
   const originalEnableAdaptive = typeof aac.enableAdaptiveRecalibration === 'function'
@@ -30,7 +32,18 @@
   }
 
   function authorized() {
-    return state.sessionFitAuthorized && fitted();
+    return state.sessionAuthorizedFit && fitted();
+  }
+
+  function captureQuality() {
+    try {
+      const fusion = window.webgazerCaptureFusion;
+      if (!fusion || typeof fusion.getLive !== 'function') return { available: false, reliability: 1 };
+      const live = fusion.getLive() || {};
+      return { available: !!live.available, reliability: Number(live.reliability || 0) };
+    } catch (_) {
+      return { available: false, reliability: 1 };
+    }
   }
 
   function activatePostCalibration() {
@@ -65,18 +78,19 @@
   if (originalFit) {
     aac.fitUserBasis = function (...args) {
       const result = originalFit(...args);
-      state.sessionFitAuthorized = !!(result && result.rebuilt && fitted());
-      if (state.sessionFitAuthorized) activatePostCalibration();
+      state.sessionAuthorizedFit = !!(result && result.rebuilt && fitted());
+      if (state.sessionAuthorizedFit) activatePostCalibration();
       return result;
     };
   }
 
   if (originalClear) {
     aac.clearAllCalibration = async function (...args) {
-      state.sessionFitAuthorized = false;
+      const result = await originalClear(...args);
+      state.sessionAuthorizedFit = false;
       state.adaptiveActivated = false;
       state.driftActivated = false;
-      return originalClear(...args);
+      return result;
     };
   }
 
@@ -88,6 +102,13 @@
       timer.updateFromGaze = function (...updateArgs) {
         if (!authorized()) {
           state.blockedDwellUpdates++;
+          state.blockedForCalibration++;
+          return null;
+        }
+        const q = captureQuality();
+        if (q.available && q.reliability < 0.35) {
+          state.blockedDwellUpdates++;
+          state.blockedForCaptureQuality++;
           return null;
         }
         activatePostCalibration();
@@ -101,7 +122,7 @@
   window.webgazerAACAssuranceGuard = {
     version: '0.2',
     isPCAFitted: fitted,
-    isSessionFitAuthorized: authorized,
-    getState: () => ({ ...state, pcaFitted: fitted(), sessionAuthorized: authorized() }),
+    isSessionAuthorized: authorized,
+    getState: () => ({ ...state, pcaFitted: fitted(), sessionAuthorized: authorized(), captureQuality: captureQuality() }),
   };
 })();
