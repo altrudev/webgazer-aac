@@ -6,9 +6,9 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const port = Number(process.env.PORT || 4818);
-const expectedWebGazerVersion = '3.5.3';
 const codespaceWebGazer = process.env.WEBGAZER_353_PATH || '/workspaces/WebGazer/dist/webgazer.js';
-const codespaceWebGazerPackage = process.env.WEBGAZER_353_PACKAGE_PATH || path.resolve(path.dirname(codespaceWebGazer), '..', 'package.json');
+const codespaceWebGazerPackage = process.env.WEBGAZER_353_PACKAGE || '/workspaces/WebGazer/package.json';
+const expectedWebGazerVersion = '3.5.3';
 const types = { '.html':'text/html; charset=utf-8', '.js':'text/javascript; charset=utf-8', '.css':'text/css; charset=utf-8', '.json':'application/json; charset=utf-8' };
 
 function commonHeaders(extra = {}) {
@@ -23,36 +23,31 @@ function commonHeaders(extra = {}) {
 function inspectCodespaceWebGazer() {
   const result = {
     available: false,
-    identityVerified: false,
+    verified: false,
     expectedVersion: expectedWebGazerVersion,
     version: null,
-    source: 'codespace-build',
-    bundleSha256: null,
+    packageName: null,
     bundleBytes: null,
+    bundleSha256: null,
+    source: 'codespace-build',
     reason: null,
   };
   try {
-    if (!fs.existsSync(codespaceWebGazer) || !fs.statSync(codespaceWebGazer).isFile()) {
-      result.reason = 'bundle-missing';
-      return result;
-    }
-    if (!fs.existsSync(codespaceWebGazerPackage) || !fs.statSync(codespaceWebGazerPackage).isFile()) {
-      result.reason = 'package-metadata-missing';
-      return result;
-    }
+    if (!fs.existsSync(codespaceWebGazerPackage)) throw new Error(`package metadata missing: ${codespaceWebGazerPackage}`);
+    if (!fs.existsSync(codespaceWebGazer) || !fs.statSync(codespaceWebGazer).isFile()) throw new Error(`bundle missing: ${codespaceWebGazer}`);
     const pkg = JSON.parse(fs.readFileSync(codespaceWebGazerPackage, 'utf8'));
-    const data = fs.readFileSync(codespaceWebGazer);
+    const bundle = fs.readFileSync(codespaceWebGazer);
     result.available = true;
     result.version = typeof pkg.version === 'string' ? pkg.version : null;
-    result.bundleBytes = data.length;
-    result.bundleSha256 = crypto.createHash('sha256').update(data).digest('hex');
-    result.identityVerified = result.version === expectedWebGazerVersion;
-    if (!result.identityVerified) result.reason = 'version-mismatch';
-    return result;
+    result.packageName = typeof pkg.name === 'string' ? pkg.name : null;
+    result.bundleBytes = bundle.length;
+    result.bundleSha256 = crypto.createHash('sha256').update(bundle).digest('hex');
+    result.verified = result.version === expectedWebGazerVersion;
+    if (!result.verified) result.reason = `package version ${result.version || 'unknown'} does not match ${expectedWebGazerVersion}`;
   } catch (error) {
-    result.reason = `inspection-error:${String(error.message || error)}`;
-    return result;
+    result.reason = String(error && error.message || error);
   }
+  return result;
 }
 
 const server = http.createServer((req, res) => {
@@ -65,31 +60,26 @@ const server = http.createServer((req, res) => {
   }
 
   if (raw === '/__webgazer__/status') {
-    const status = inspectCodespaceWebGazer();
-    res.writeHead(status.identityVerified ? 200 : 409, commonHeaders({ 'Content-Type':'application/json; charset=utf-8' }));
-    res.end(JSON.stringify(status));
+    const identity = inspectCodespaceWebGazer();
+    res.writeHead(identity.verified ? 200 : 409, commonHeaders({ 'Content-Type':'application/json; charset=utf-8' }));
+    res.end(JSON.stringify(identity));
     return;
   }
 
   if (raw === '/__webgazer__/webgazer.js') {
-    const status = inspectCodespaceWebGazer();
-    if (!status.identityVerified) {
-      res.writeHead(409, commonHeaders({ 'Content-Type':'text/plain; charset=utf-8' }));
-      res.end(`WebGazer identity not verified: expected ${expectedWebGazerVersion}, observed ${status.version || 'unknown'} (${status.reason || 'unverified'})`);
+    const identity = inspectCodespaceWebGazer();
+    if (!identity.verified) {
+      res.writeHead(409, commonHeaders({ 'Content-Type':'application/json; charset=utf-8' }));
+      res.end(JSON.stringify(identity));
       return;
     }
-    try {
-      const data = fs.readFileSync(codespaceWebGazer);
-      res.writeHead(200, commonHeaders({
-        'Content-Type':'text/javascript; charset=utf-8',
-        'X-WebGazer-Version': status.version,
-        'X-WebGazer-SHA256': status.bundleSha256,
-      }));
-      res.end(data);
-    } catch (_) {
-      res.writeHead(404, commonHeaders({ 'Content-Type':'text/plain; charset=utf-8' }));
-      res.end('Verified WebGazer bundle became unavailable.');
-    }
+    const data = fs.readFileSync(codespaceWebGazer);
+    res.writeHead(200, commonHeaders({
+      'Content-Type':'text/javascript; charset=utf-8',
+      'X-WebGazer-Version': identity.version,
+      'X-WebGazer-SHA256': identity.bundleSha256,
+    }));
+    res.end(data);
     return;
   }
 
@@ -110,11 +100,11 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(port, '127.0.0.1', () => {
-  const status = inspectCodespaceWebGazer();
+  const identity = inspectCodespaceWebGazer();
   console.log(`webgazer-aac pre-hardware lab: http://127.0.0.1:${port}/demo/prehardware/`);
-  if (status.identityVerified) {
-    console.log(`Codespace WebGazer verified: v${status.version}, ${status.bundleBytes} bytes, sha256 ${status.bundleSha256}`);
+  if (identity.verified) {
+    console.log(`Codespace WebGazer ${identity.version} verified: ${identity.bundleBytes} bytes sha256=${identity.bundleSha256}`);
   } else {
-    console.log(`Codespace WebGazer NOT verified: ${status.reason || 'unknown'}; expected v${expectedWebGazerVersion}, observed ${status.version || 'unknown'}`);
+    console.log(`Codespace WebGazer unavailable or unverified: ${identity.reason || 'unknown reason'}`);
   }
 });
