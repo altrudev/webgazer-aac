@@ -1,0 +1,24 @@
+{
+  "schema": "webgazer-aac/promotion-gate/0.1",
+  "status": "blocked-until-exact-artifact-identity",
+  "branch": "agent/webgazer-aac-v2",
+  "repositoryRuntimeGitBlob": "471e37e4dcd0dff4c7fa20f1e81e8aac4b29463c",
+  "verifiedCandidate": {
+    "sha256": "b72ce6170826ab56c78b9afa716c05faaf743b4755a76bbc4b969a9900ec1770",
+    "expectedGitBlob": "5fbf87f39cd68ac0a4b1f05ef3cd64c3d44f97b6",
+    "checksPassed": 80,
+    "checksFailed": 0
+  },
+  "rejectedTransfer": {
+    "gitBlob": "c1fd07d682b0581fcd4dae8129adb6707d2f38a0",
+    "attachedToBranch": false,
+    "reason": "Transferred bytes did not reproduce the verified candidate identity."
+  },
+  "invariant": "Validation authority remains bound to the exact artifact identity. A different artifact may not inherit the candidate's evidence merely because it is intended to contain the same change.",
+  "requiredBeforePromotion": [
+    "Promoted webgazer-aac.js reproduces candidate SHA-256 b72ce6170826ab56c78b9afa716c05faaf743b4755a76bbc4b969a9900ec1770",
+    "Promoted webgazer-aac.js reproduces Git blob 5fbf87f39cd68ac0a4b1f05ef3cd64c3d44f97b6",
+    "80-check pre-hardware gate is rerun against the repository-promoted artifact"
+  ],
+  "hardwareTestingAuthorized": false
+}
