@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — pre-hardware browser lab
+
+### Experimental gaze capture and validation
+
+- Added a refined 478-landmark iris/head-pose capture experiment without modifying the verified canonical runtime.
+- Isolated the legacy MediaPipe FaceMesh/Emscripten/WASM runtime in a same-origin hidden frame so it cannot share `Module`/filesystem globals with WebGazer 3.5.3.
+- Reused the isolated detector for direct iris-motion diagnostics, avoiding a second FaceMesh runtime in the main page.
+- Added `requestVideoFrameCallback()` capture timing with one-in-flight inference pairing and an interval fallback; evidence records frame interval, busy-frame drops, and capture-to-result latency.
+- Added eye-corner-local iris coordinates, One-Euro feature filtering, per-eye glare/clipping/aperture/occlusion reliability, bilateral agreement, head-pose and distance/centering features.
+- Added an eyewear validation cohort label (`unknown`, `none`, `glasses`, `contacts`) as user-declared evidence only; eyewear is not inferred.
+- Added a 1.5-second positioning-quality gate covering centering, distance, head pose, lighting symmetry, and per-eye reliability.
+- Added an 18-second Lissajous smooth-pursuit calibration path. Raw eye images and raw landmarks are never persisted.
+- Added linear, polynomial-2, and RBF kernel-ridge experimental gaze models with feature standardization, quality weighting, deterministic RBF training-budget thinning, held-out cross-validation, and leave-region-out spatial evaluation.
+- Added reliability/error-weighted experimental fusion against the untouched WebGazer prediction baseline.
+- Added deterministic tests for glare/occlusion/blinks, bilateral fusion, One-Euro feature filtering, nonlinear RBF mapping, spatial holdout, pursuit coverage, positioning gates, and detector-runtime isolation.
+- The pre-hardware changes remain experimental and are not promoted into `webgazer-aac.js` without browser evidence and the existing promotion gate.
+
 ## [2.0.0] — 2026-08-16
 
 ### Correctness
