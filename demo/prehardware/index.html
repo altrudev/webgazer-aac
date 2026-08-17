@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>webgazer-aac v2 Pre-Hardware Lab</title>
+  <link rel="stylesheet" href="./lab.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <p class="eyebrow">DDC PRE-HARDWARE LAB</p>
+        <h1>webgazer-aac v2</h1>
+        <p class="sub">Local browser validation. No target action is executed by gaze; dwell completion is evidence only.</p>
+      </div>
+      <div id="runtimeBadge" class="badge">runtime loading…</div>
+    </header>
+
+    <section class="controls" aria-label="Lab controls">
+      <button id="useCodespaceBtn">Use verified Codespace WebGazer 3.5.3</button>
+      <input id="wgFile" type="file" accept=".js,text/javascript" hidden disabled aria-hidden="true">
+      <button id="startBtn" disabled>Start camera</button>
+      <button id="stopBtn" disabled>Stop</button>
+      <button id="resetBtn">Clear calibration</button>
+      <button id="downloadBtn">Download evidence</button>
+    </section>
+    <p class="hint">Assurance mode accepts only the independently verified Codespace WebGazer 3.5.3 artifact. Arbitrary JavaScript upload is disabled.</p>
+
+    <section class="statusGrid" aria-label="Live status">
+      <article><span>WebGazer</span><strong id="wgStatus">not loaded</strong></article>
+      <article><span>Tracking quality</span><strong id="quality">0.00</strong></article>
+      <article><span>Target confidence</span><strong id="targetConfidence">0.00</strong></article>
+      <article><span>Drift RMSE</span><strong id="drift">0</strong></article>
+      <article><span>Gaze FPS</span><strong id="fps">0</strong></article>
+      <article><span>Eye features</span><strong id="coverage">0%</strong></article>
+    </section>
+
+    <section class="validationGrid" aria-label="Browser beta validation state">
+      <article><span>WebGazer identity</span><strong id="identityGate">NOT VERIFIED</strong></article>
+      <article><span>MediaPipe assets</span><strong id="mediaPipeGate">NOT VERIFIED</strong></article>
+      <article><span>Session</span><strong id="sessionGate">NOT RUNNING</strong></article>
+      <article><span>PCA basis</span><strong id="pcaGate">NOT FITTED</strong></article>
+      <article><span>Distinct dwell targets</span><strong id="targetGate">0 / 3</strong></article>
+      <article class="readiness"><span>Browser beta readiness</span><strong id="readinessGate">NOT READY</strong><small id="readinessReason">Complete the required gates.</small></article>
+    </section>
+
+    <section class="workspace">
+      <article class="panel calibrationPanel">
+        <div class="panelHead">
+          <div><p class="eyebrow">CALIBRATION</p><h2>Look, then click each point</h2></div>
+          <div class="fitControl">
+            <strong id="fitState" class="fitState">PCA NOT FITTED</strong>
+            <button id="fitBtn" disabled>Fit user basis</button>
+          </div>
+        </div>
+        <div id="calibrationGrid" class="calibrationGrid" aria-label="Calibration targets"></div>
+        <p id="calibrationStatus" class="hint">Load WebGazer and start the camera first.</p>
+      </article>
+
+      <article class="panel aacPanel">
+        <div class="panelHead">
+          <div><p class="eyebrow">AAC TARGET RESOLUTION</p><h2>Evidence-only dwell board</h2></div>
+          <strong id="lastSelection">No selection</strong>
+        </div>
+        <div id="aacBoard" class="aacBoard">
+          <button data-gaze-target>YES</button>
+          <button data-gaze-target>NO</button>
+          <button data-gaze-target>HELP</button>
+          <button data-gaze-target>DRINK</button>
+          <button data-gaze-target>FOOD</button>
+          <button data-gaze-target>PAIN</button>
+          <button data-gaze-target>MORE</button>
+          <button data-gaze-target>STOP</button>
+          <button data-gaze-target>THANK YOU</button>
+        </div>
+        <p class="hint">Readiness requires a fitted PCA basis and evidence-only dwell completion on at least 3 distinct AAC targets. Gaze never executes the target action.</p>
+      </article>
+    </section>
+
+    <section class="panel evidencePanel">
+      <div class="panelHead"><div><p class="eyebrow">EVIDENCE</p><h2>Session log</h2></div><span id="sessionState">idle</span></div>
+      <pre id="log" aria-live="polite"></pre>
+    </section>
+  </main>
+
+  <div id="gazeDot" class="gazeDot" hidden></div>
+  <script>
+    const assuranceUpload = document.getElementById('wgFile');
+    assuranceUpload.addEventListener('change', event => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      assuranceUpload.value = '';
+    }, true);
+  </script>
+  <script src="../../webgazer-aac.js"></script>
+  <script src="./capture-fusion-core.js"></script>
+  <script src="./assurance-guard.js"></script>
+  <script src="./lab.js"></script>
+  <script src="./camera-quality.js"></script>
+  <script src="./eye-motion.js"></script>
+  <script>
+    (() => {
+      let fusionLoaded = false;
+      const session = document.getElementById('sessionState');
+      const loadFusion = () => {
+        if (fusionLoaded || !session || session.textContent.trim().toLowerCase() !== 'running') return;
+        fusionLoaded = true;
+        const script = document.createElement('script');
+        script.src = `./capture-fusion.js?t=${Date.now()}`;
+        script.async = true;
+        script.dataset.deferredUntilSessionRunning = 'true';
+        document.body.appendChild(script);
+      };
+      if (session) {
+        new MutationObserver(loadFusion).observe(session, { childList: true, characterData: true, subtree: true });
+      }
+      loadFusion();
+    })();
+  </script>
+</body>
+</html>

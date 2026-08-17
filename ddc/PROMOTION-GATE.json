@@ -1,0 +1,25 @@
+{
+  "schema": "webgazer-aac/promotion-gate/0.1",
+  "status": "verified-candidate-repository-packaged",
+  "branch": "agent/webgazer-aac-v2",
+  "verifiedCandidate": {
+    "artifact": "ddc/candidate/webgazer-aac.compact.js.gz.b64",
+    "materializer": "scripts/materialize-verified-candidate.mjs",
+    "sha256": "e2049bad33eb37a6bfeb375490455d78a33d8cb31bb16339fa2cabf02715f5e1",
+    "expectedGitBlob": "2b98d877627af794f507cf1d7911a456135f0d82",
+    "bytes": 51666,
+    "checksPassed": 80,
+    "checksFailed": 0
+  },
+  "invariant": "Validation authority remains bound to exact artifact identity. Materialization must reproduce byte count, SHA-256 and Git blob before tests may authorize the generated runtime.",
+  "repositoryGate": "npm run gate:prehardware",
+  "requiredBeforeHardwareTesting": [
+    "Materializer reproduces the verified candidate identity in webgazer-aac.js",
+    "22 core invariant checks pass",
+    "10 integration checks pass",
+    "38 DDC pre-hardware assurance checks pass",
+    "10 bounded long-session checks pass"
+  ],
+  "hardwareTestingAuthorized": false,
+  "note": "Real browser/webcam/AAC-board testing remains a separate authority transition after the executable repository gate is reproduced."
+}

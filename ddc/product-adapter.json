@@ -1,0 +1,36 @@
+{
+  "protocol": "ddc-platform/product-adapter",
+  "version": "0.1",
+  "id": "webgazer-aac/pre-hardware",
+  "label": "WebGazer AAC pre-hardware assurance adapter",
+  "kinds": ["javascript-library", "aac-gaze-layer"],
+  "intake": {
+    "detect": true,
+    "inspect": true,
+    "formFields": [
+      {"id":"webgazerVersion","label":"WebGazer version","type":"text","required":true,"goal":"pre-hardware-assurance"},
+      {"id":"targetProfile","label":"AAC target profile","type":"select","required":true,"goal":"pre-hardware-assurance","options":["static-fixture","representative-board","hardware-session"]}
+    ]
+  },
+  "operations": {
+    "describe": true,
+    "prepare": true,
+    "launch": false,
+    "health": true,
+    "act": false,
+    "observe": true,
+    "snapshot": true,
+    "trace": true,
+    "reset": true,
+    "test": true,
+    "collect": true,
+    "stop": true
+  },
+  "evidence": ["metrics", "files", "stdout", "stderr", "custom"],
+  "authority": {
+    "networkDefault": "deny",
+    "filesystem": "workspace-read",
+    "requiresIsolation": true,
+    "notes": "Pre-hardware assurance may inspect and execute bounded test fixtures; it may not activate a real AAC target or broaden network/filesystem authority."
+  }
+}

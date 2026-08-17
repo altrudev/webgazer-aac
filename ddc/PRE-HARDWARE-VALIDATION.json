@@ -1,0 +1,49 @@
+{
+  "schema": "webgazer-aac/pre-hardware-validation/0.1",
+  "observedAt": "2026-08-16T18:30:00Z",
+  "candidate": {
+    "file": "ddc/candidate/webgazer-aac.compact.js.gz.b64",
+    "materializedFile": "webgazer-aac.js",
+    "materializer": "scripts/materialize-verified-candidate.mjs",
+    "version": "2.0.0",
+    "state": "repository-packaged-verified-materializable",
+    "sha256": "e2049bad33eb37a6bfeb375490455d78a33d8cb31bb16339fa2cabf02715f5e1",
+    "expectedGitBlob": "2b98d877627af794f507cf1d7911a456135f0d82",
+    "bytes": 51666
+  },
+  "environment": {
+    "node": "v22.16.0",
+    "networkUsedByRuntime": false,
+    "hardwareWebcamUsed": false,
+    "browserUsed": false
+  },
+  "result": {
+    "status": "pass-verified-candidate",
+    "checksPassed": 80,
+    "checksFailed": 0,
+    "suites": [
+      {"id":"core-invariants","passed":22,"failed":0},
+      {"id":"integration-audit","passed":10,"failed":0},
+      {"id":"ddc-pre-hardware-assurance","passed":38,"failed":0},
+      {"id":"bounded-long-session","passed":10,"failed":0,"simulatedGazeFrames":20000}
+    ]
+  },
+  "promotionIntegrity": {
+    "status": "reproducible-materialization-required-before-hardware-test",
+    "rule": "The materializer refuses promotion unless byte count, SHA-256 and Git blob all match the verified candidate.",
+    "command": "npm run gate:prehardware"
+  },
+  "evidenceClass": "observed",
+  "authority": {
+    "ddcPlatformProviderExecuted": false,
+    "ddcRouterRunRecorded": false,
+    "claim": "Deterministic pre-hardware reproduction using DDC contracts/invariants; not a DDC provider execution claim"
+  },
+  "remainingGates": [
+    "Run repository gate:prehardware in an executable checkout so the verified candidate is materialized into webgazer-aac.js and all 80 checks rerun",
+    "real browser and webcam validation",
+    "representative AAC board interaction validation",
+    "held-out performance measurement",
+    "human-factors validation"
+  ]
+}

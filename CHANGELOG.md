@@ -1,231 +1,89 @@
 # Changelog
 
-## [1.3.0] — 2026-03-12
+## Unreleased — pre-hardware browser lab
 
-### Added
+### Experimental gaze capture and validation
 
-**Confidence-gated dwell timer** (`DwellTimer` class)
-- Tracks gaze fixation on DOM elements; progress advances only when Kalman confidence meets the threshold
-- Progress **freezes** (does not reset) during low confidence, blinks, and saccades — resumes when gaze stabilises
-- Progress resets to 0 only when gaze leaves the element entirely
-- Fires `webgazer-aac:dwell-progress`, `webgazer-aac:dwell-complete`, and `webgazer-aac:dwell-cancel` CustomEvents on the target element
-- On completion, automatically calls `recordDwellHitXY()` so the drift watchdog and adaptive recalibrator both receive the signal
-- Configurable: `dwellMs`, `minConfidence`, `holdAfterMs`
-- Create via `webgazerAAC.createDwellTimer(options)` — wired to the instance automatically
+- Added a refined 478-landmark iris/head-pose capture experiment without modifying the verified canonical runtime.
+- Isolated the legacy MediaPipe FaceMesh/Emscripten/WASM runtime in a same-origin hidden frame so it cannot share `Module`/filesystem globals with WebGazer 3.5.3.
+- Reused the isolated detector for direct iris-motion diagnostics, avoiding a second FaceMesh runtime in the main page.
+- Added `requestVideoFrameCallback()` capture timing with one-in-flight inference pairing and an interval fallback; evidence records frame interval, busy-frame drops, and capture-to-result latency.
+- Added eye-corner-local iris coordinates, One-Euro feature filtering, per-eye glare/clipping/aperture/occlusion reliability, bilateral agreement, head-pose and distance/centering features.
+- Added an eyewear validation cohort label (`unknown`, `none`, `glasses`, `contacts`) as user-declared evidence only; eyewear is not inferred.
+- Added a 1.5-second positioning-quality gate covering centering, distance, head pose, lighting symmetry, and per-eye reliability.
+- Added an 18-second Lissajous smooth-pursuit calibration path. Raw eye images and raw landmarks are never persisted.
+- Added linear, polynomial-2, and RBF kernel-ridge experimental gaze models with feature standardization, quality weighting, deterministic RBF training-budget thinning, held-out cross-validation, and leave-region-out spatial evaluation.
+- Added reliability/error-weighted experimental fusion against the untouched WebGazer prediction baseline.
+- Added deterministic tests for glare/occlusion/blinks, bilateral fusion, One-Euro feature filtering, nonlinear RBF mapping, spatial holdout, pursuit coverage, positioning gates, and detector-runtime isolation.
+- The pre-hardware changes remain experimental and are not promoted into `webgazer-aac.js` without browser evidence and the existing promotion gate.
 
-**IndexedDB calibration persistence** (`CalibrationStore` class)
-- Saves and restores full calibration state across sessions: regression datasets, fitted PCA bases, Kalman noise params, screen dimensions
-- Async API: `saveCalibration()`, `loadCalibration()`, `clearCalibration()`, `isStorageAvailable()`
-- Version-checked on load — stale snapshots (wrong `aacVersion`) return `null` rather than silently corrupting state
-- Screen-size mismatch surfaced as `_screenMismatch: true` on the snapshot; caller decides whether to trust a cross-resolution calibration
-- Graceful fallback in private browsing (IDB unavailable) — `save` returns `false`, `load` returns `null`
-- `_MemoryBackend` class exposed for zero-IDB unit testing
-- Multi-profile support via `profileKey` option
+## [2.0.0] — 2026-08-16
 
-### API additions
+### Correctness
 
-```js
-// Dwell timer
-const timer = webgazerAAC.createDwellTimer({ dwellMs, minConfidence, holdAfterMs });
-timer.update(element, x, y, confidence, isSaccade, isBlink?)  // → progress 0–1
-timer.reset()
+- Reworked the WebGazer integration to consume `data.eyeFeatures` from the same WebGazer 3.5.3 prediction frame instead of re-invoking tracker patch extraction.
+- Added fixed-size eye-patch normalization so variable FaceMesh crop sizes feed a stable feature pipeline.
+- Fixed the PCA feature-space transition: calibration patches are retained in normalized raw form, the per-user PCA basis is fitted, and every regression sample is rebuilt in the fitted basis.
+- Removed circular dwell evidence from the built-in path. Dwell completion now uses the selected target's anchor as low-weight supervision instead of feeding the predicted gaze coordinate back as truth.
+- Drift residuals are evaluated before the newly confirmed label is added to the regression model.
+- Kept polynomial and RBF training evidence synchronized so switching local regression modes does not activate a stale secondary model.
+- `configureStore()` state now survives `install()`.
 
-// Calibration persistence
-await webgazerAAC.saveCalibration(options?)
-await webgazerAAC.loadCalibration(options?)
-await webgazerAAC.clearCalibration(options?)
-await webgazerAAC.isStorageAvailable()
-webgazerAAC.getCalibrationSnapshot()          // → serialisable plain object
-webgazerAAC.applyCalibrationSnapshot(snap)    // → boolean
-webgazerAAC.configureStore({ dbName, storeName, profileKey })
-```
+### AAC interaction
 
-Events fired on the dwell target element:
-```js
-'webgazer-aac:dwell-progress'   // { progress, confidence, x, y, frozen }
-'webgazer-aac:dwell-complete'   // { x, y }
-'webgazer-aac:dwell-cancel'     // { reason, x, y }
-```
+- Added `GazeTargetResolver` with actionable-ancestor canonicalization, expanded target geometry, candidate competition, target hysteresis, and short-lived DOM target caching.
+- Added `targetConfidence`, separate from gaze tracking quality.
+- Added `AdaptiveDwellController` and integrated it with `DwellTimer`.
+- Added `DwellTimer.updateFromGaze()` for direct resolver + dwell operation.
+- Added `recordConfirmedSelection()` as the evidence-safe adaptive feedback path.
+- Retained `recordDwellHit()` and `recordDwellHitXY()` compatibility helpers; XY-only evidence is deliberately low-weight by default.
 
-### Upgrade from v1.2.0
+### Signal semantics
 
-```html
-<!-- Was -->
-<script src="webgazer-aac.js"></script>
-<script>
-  webgazerAAC.install().enableAdaptiveRecalibration().enableDriftWatchdog();
-</script>
+- Replaced the ambiguous primary `confidence` concept with explicit `gazeStability` and `trackingQuality` fields.
+- Retained `confidence` as a deprecated compatibility alias of `trackingQuality`.
+- Added explicit evidence provenance/weighting for calibration, explicit input, confirmed click, dwell selection, and inferred coordinates.
 
-<!-- Now — add persistence and dwell timer -->
-<script src="webgazer-aac.js"></script>
-<script>
-  webgazerAAC.install().enableAdaptiveRecalibration().enableDriftWatchdog();
+### Persistence
 
-  // Restore previous calibration on load
-  webgazerAAC.loadCalibration().then(saved => {
-    if (!saved) {
-      // run calibration UI, then:
-      webgazerAAC.fitUserBasis();
-      webgazerAAC.saveCalibration();
-    }
-    webgazer.begin();
-  });
+- Introduced independent `libraryVersion`, `schemaVersion`, and `featureVersion` fields.
+- Moved default storage to a v2 object store.
+- Feature-space incompatibility is surfaced explicitly rather than silently applied.
+- Material viewport changes mark a snapshot `_validationRequired`; such snapshots are returned without automatic activation.
 
-  // Replace manual dwell logic with:
-  const timer = webgazerAAC.createDwellTimer({ dwellMs: 800 });
-  webgazer.setGazeListener((data) => {
-    if (!data) return;
-    const el = document.elementFromPoint(data.x, data.y);
-    timer.update(el, data.x, data.y, data.confidence, data.isSaccade);
-  });
-</script>
-```
+### Diagnostics
 
-Everything else is backwards-compatible.
+- Added `getDiagnostics()` for frame cadence, eye-feature coverage, fallbacks, blink/saccade frames, evidence counts, calibration state, tracking quality, and drift state.
+- Added optional `attachVideoClock(video)` support using `requestVideoFrameCallback()` when available.
+
+### Tests and repository cleanup
+
+- Replaced inconsistent 1.x test files with one canonical zero-dependency v2 invariant suite.
+- Added `package.json` with `npm test`.
+- Added architecture and validation-boundary documentation.
+- Removed stale duplicate README/test artifacts.
+
+### Compatibility
+
+- Targeted to WebGazer 3.5.3, the final planned upstream release.
+- v1.x calibration snapshots are not feature-compatible with v2 and require recalibration.
 
 ---
 
-## [1.2.0] — 2026-03-12
+## 1.x history
 
-### Added
+### [1.3.0] — 2026-03-12
 
-**Drift watchdog** (`DriftWatchdog` class)
-- Detects when the regression model silently degrades mid-session using an independent ground-truth residual signal
-- Every confirmed gaze position (calibration click, dwell hit, `recordScreenPosition`) is compared against the current prediction; residuals are tracked as an exponential-decay-weighted RMSE
-- Two configurable thresholds: `warnThreshold` (default 120px) and `critThreshold` (default 220px)
-- Hysteretic: won't re-fire the same level until RMSE cools below 80% of the threshold — prevents event storms
-- `minSamples` gate (default 8) prevents false alerts during model warm-up
-- Fires `webgazer-aac:drift-warning` and `webgazer-aac:drift-critical` CustomEvents on `document`
-- Optional `onWarn` / `onCritical` callbacks in addition to CustomEvents
-- Distinct from ensemble error tracking (`_errPoly`/`_errRbf`), which only compares models against each other — the watchdog uses independent ground-truth and catches both models drifting together
+Added confidence-gated dwell and IndexedDB calibration persistence.
 
-### API additions
+### [1.2.0] — 2026-03-12
 
-```js
-webgazerAAC.enableDriftWatchdog(options?)   // { warnThreshold, critThreshold, minSamples, onWarn, onCritical }
-webgazerAAC.disableDriftWatchdog()
-webgazerAAC.resetDriftWatchdog()            // call after re-calibration
-webgazerAAC.getDriftRmse()                  // → current weighted RMSE in px
-```
+Added drift watchdog and residual events.
 
-Events fired on `document`:
-```js
-'webgazer-aac:drift-warning'    // { rmse, level, sampleCount, timestamp }
-'webgazer-aac:drift-critical'   // { rmse, level, sampleCount, timestamp }
-```
+### [1.1.0] — 2026-03-12
 
-### Wiring
+Added per-user PCA, contrast normalization, Kalman smoothing, blink detection, saccade suppression, ensemble regression, and frame caching.
 
-`recordScreenPosition` and `recordDwellHitXY` both now feed the drift watchdog automatically when it is enabled. No changes required in application code.
+### [1.0.0] — 2026-03-12
 
-### Upgrade from v1.1.0
-
-```html
-<!-- Was -->
-<script src="webgazer-aac.js"></script>
-<script>webgazerAAC.install().enableAdaptiveRecalibration();</script>
-
-<!-- Now — optionally add drift watchdog -->
-<script src="webgazer-aac.js"></script>
-<script>
-  webgazerAAC.install().enableAdaptiveRecalibration().enableDriftWatchdog();
-
-  document.addEventListener('webgazer-aac:drift-warning', e => {
-    console.warn('Gaze drift detected — RMSE:', e.detail.rmse, 'px');
-  });
-</script>
-```
-
-Everything else is backwards-compatible.
-
----
-
-## [1.1.0] — 2026-03-12
-
-### Added
-
-**Per-user PCA basis** (`PCABasis` class)
-- Eye patch features are now projected onto a basis fitted from the user's own calibration patches, rather than a fixed random projection
-- Call `webgazerAAC.fitUserBasis()` at the end of your calibration sequence
-- Uses power iteration in sample space (n×n, not dim×dim) so it runs in ~5–20ms even on slow devices
-- Falls back gracefully to the random projection if insufficient patches were collected
-
-**CLAHE contrast normalisation**
-- Adaptive histogram equalisation applied to every eye patch before feature extraction
-- Dramatically improves feature quality in poor or uneven lighting without blowing out highlights
-- No new dependencies — pure JS canvas math
-
-**Kalman filter** (replaces EMA velocity smoother)
-- 4-state filter: [x, y, vx, vy] — tracks position and velocity simultaneously
-- Separates process noise (real head movement) from measurement noise (regression jitter)
-- Measurement update is skipped during blinks and saccades, allowing the filter to coast on its own prediction
-- Tunable via `webgazerAAC.setKalmanParams(processNoise, measurementNoise)`
-- Exposes `vx`, `vy` velocity components in every prediction
-
-**Blink detection** (`BlinkDetector` class)
-- Measures mean eye-patch brightness per frame; triggers when brightness drops below an adaptive threshold
-- Outputs `null` during blinks so dwell timers don't advance falsely
-- Includes a configurable post-blink lockout (default 80ms) to absorb reopening jitter
-
-**Saccade suppression** (`SaccadeDetector` class)
-- Uses Kalman velocity estimate to detect fast eye movements (default threshold: 600 px/sec)
-- Suppresses Kalman measurement update during saccades; prediction coasts instead
-- Passes `isSaccade: true` flag in prediction for downstream gating
-
-**Ensemble regression** (`EnsembleRegression` class)
-- Blends polynomial and RBF predictions, weighted inversely by each model's rolling RMSE
-- Whichever model has lower recent error gets more weight — adapts over the session
-- Falls back to whichever model is ready if only one has sufficient calibration data
-- Now the default regression mode (was `polynomial` in v1.0.0)
-
-**Frame cache** (`FrameCache` class)
-- Skips regression inference when gaze velocity is below threshold (default: 15 px/sec)
-- Reuses the last prediction for up to 50ms during stable fixation
-- Saves 20–40% CPU on typical hardware; more on mobile/low-power devices
-
-### Changed
-
-- Default regression mode: `polynomial` → `ensemble`
-- `PATCH_COMPONENTS` increased from 8 to 10 per eye
-- `VelocitySmoother` replaced by `KalmanFilter` — same API surface via `smooth(x, y, isBlink, isSaccade)`
-- `recordScreenPosition` intercept now also calls `EnsembleRegression.trackError()` to keep error weights current
-- `AdaptiveRecalibrator.maxHitsPerSession` increased from 200 → 500
-
-### API additions
-
-```js
-webgazerAAC.fitUserBasis()               // fit PCA after calibration
-webgazerAAC.resetCalibrationPatches()    // clear stored patches before re-calibration
-webgazerAAC.setKalmanParams(Q, R)        // tune Kalman noise parameters
-webgazerAAC.isPCAFitted()                // → boolean
-webgazerAAC.setRegression('ensemble')   // new default mode
-```
-
-Prediction objects now include:
-```js
-{ x, y, confidence, isSaccade }   // isBlink frames return null instead
-```
-
-### Upgrade from v1.0.0
-
-```html
-<!-- Was -->
-<script src="webgazer-aac.js"></script>
-<script>webgazerAAC.install().enableAdaptiveRecalibration();</script>
-
-<!-- Now — add fitUserBasis() at calibration end -->
-<script src="webgazer-aac.js"></script>
-<script>
-  webgazerAAC.install().enableAdaptiveRecalibration();
-  // ... after user completes calibration:
-  webgazerAAC.fitUserBasis();
-</script>
-```
-
-Everything else is backwards-compatible. Existing `setRegression('polynomial')` / `'rbf'` / `'ridge'` calls still work.
-
----
-
-## [1.0.0] — 2026-03-12
-
-Initial release. Polynomial regression, RBF regression, velocity-aware EMA smoother, adaptive recalibration via dwell hits, prediction confidence score.
+Initial accessibility-focused WebGazer enhancement release.
