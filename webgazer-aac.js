@@ -1385,7 +1385,7 @@
     _lastResult:     null,
     _trainingLocked: false,
     _lastPatchAt: 0,
-    _trainingAccepted: 0,
+    _trainingAttempts: 0,
 
     install() {
       if (this._installed) return this;
@@ -1483,7 +1483,7 @@
         if (!Number.isFinite(x) || !Number.isFinite(y) || !self._lastPatches || performance.now()-self._lastPatchAt>180) return false;
         _origRecord(x, y, eventType);
         if (self._regression && self._lastPatches) {
-          self._trainingAccepted++;
+          self._trainingAttempts++;
           try {
             self._regression.addData(self._lastPatches, x, y);
             // Track ensemble error
@@ -1514,13 +1514,13 @@
       for (const basis of [LEFT_PCA,RIGHT_PCA]) { basis.fitted=false;basis.mean=null; }
       this.resetCalibrationPatches();
       this._lastPatches=null;this._lastPatchAt=0;this._lastResult=null;
-      this._trainingAccepted=0;this._cache=new FrameCache();this._kalman.reset();
+      this._trainingAttempts=0;this._cache=new FrameCache();this._kalman.reset();
       if (this._watchdog) this._watchdog.reset();
       return true;
     },
     lockTraining(locked=true) {this._trainingLocked=!!locked;return this;},
     getTrainingEvidence() {
-      return {locked:this._trainingLocked,accepted:this._trainingAccepted,
+      return {locked:this._trainingLocked,attempted:this._trainingAttempts,
         patchAgeMs:this._lastPatchAt?performance.now()-this._lastPatchAt:null};
     },
 
