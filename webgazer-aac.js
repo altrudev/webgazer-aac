@@ -1376,18 +1376,26 @@
       const _origSetGazeListener = webgazer.setGazeListener.bind(webgazer);
       webgazer.setGazeListener = function (callback) {
         return _origSetGazeListener(function (data, elapsedTime) {
-          // Cache latest eye patches
+          // Never reuse eye patches or predicted positions after tracker loss.
+          let patches = null;
           try {
             const tracker = webgazer.getTracker();
             if (tracker) {
-              self._lastPatches =
+              patches =
                 (tracker.getEyePatches && tracker.getEyePatches()) ||
                 (tracker.getCurrentEyePatches && tracker.getCurrentEyePatches()) ||
                 (webgazer.getCurrentEyePatches && webgazer.getCurrentEyePatches()) || null;
             }
-          } catch (e) {}
-
-          if (data === null) { callback(null, elapsedTime); return; }
+          } catch (e) { patches = null; }
+          self._lastPatches = patches;
+          if (data === null || !patches || !Number.isFinite(data.x) || !Number.isFinite(data.y)) {
+            self._cache = new FrameCache();
+            self._kalman.reset();
+            self._lastResult = null;
+            self._lastConfidence = 0;
+            callback(null, elapsedTime);
+            return;
+          }
 
           // Blink detection
           const isBlink = self._blink.update(self._lastPatches);
