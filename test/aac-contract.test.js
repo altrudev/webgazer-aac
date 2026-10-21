@@ -69,3 +69,47 @@ test("Extended gaze interruption discards partial dwell", () => {
   t.update(target,1,1,0.9,false,false);assert.equal(t.progress,0);
  }finally{performance.now=original;}
 });
+
+test("Calibration restoration rejects mismatched viewport before changing state", () => {
+ const aac=global.webgazerAAC, before=aac._kalman.Q;
+ const snap={aacVersion:"1.3.0",screenWidth:1000,screenHeight:700,kalman:{Q:29,R:60},pca:{left:{fitted:false},right:{fitted:false}}};
+ assert.equal(aac.applyCalibrationSnapshot(snap),false);assert.equal(aac._kalman.Q,before);
+});
+test("Calibration restoration rejects invalid noise values without partial mutation", () => {
+ const aac=global.webgazerAAC, before=aac._kalman.Q;
+ const snap={aacVersion:"1.3.0",screenWidth:1920,screenHeight:1080,kalman:{Q:33,R:NaN},pca:{left:{fitted:false},right:{fitted:false}}};
+ assert.equal(aac.applyCalibrationSnapshot(snap),false);assert.equal(aac._kalman.Q,before);
+});
+test("Rejected calibration load returns null, not a seemingly restored snapshot", async () => {
+ const aac=global.webgazerAAC, old=aac._store, q=aac._kalman.Q;
+ aac._store={load:()=>Promise.resolve({aacVersion:"1.3.0",screenWidth:800,screenHeight:600,kalman:{Q:99,R:10}})};
+ try {assert.equal(await aac.loadCalibration(),null);assert.equal(aac._kalman.Q,q);}
+ finally {aac._store=old;}
+});
+
+test("Tracker interruption clears stale patches and rejects gaze output", () => {
+ const aac=global.webgazerAAC;
+ const prior=global.webgazer, oldInstalled=aac._installed, oldPatches=aac._lastPatches;
+ let listener=null, available=true, emitted=[];
+ global.webgazer={
+  setRegression(){return this;},
+  setGazeListener(cb){listener=cb;return this;},
+  recordScreenPosition(){return this;},
+  getTracker(){return available ? {getEyePatches(){return {left:{},right:{}};}} : null;}
+ };
+ try {
+  aac._installed=false;
+  aac.install();
+  aac._lastPatches={stale:true};
+  available=false;
+  global.webgazer.setGazeListener((value)=>emitted.push(value));
+  listener({x:100,y:100},0);
+  assert.equal(emitted.at(-1),null);
+  assert.equal(aac._lastPatches,null);
+  assert.equal(aac._lastResult,null);
+  assert.equal(aac._lastConfidence,0);
+  assert.equal(aac._kalman.x,null);
+ } finally {
+  global.webgazer=prior;aac._installed=oldInstalled;aac._lastPatches=oldPatches;
+ }
+});
