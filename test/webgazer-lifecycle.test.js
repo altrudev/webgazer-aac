@@ -70,7 +70,7 @@ test("Calibration gate rejects stale patches, freezes both models, and resets st
   callback({x:100,y:80,eyeFeatures:patches},0);
   assert.equal(global.webgazer.recordScreenPosition(100,80,"click"),undefined);
   assert.equal(upstream,1);
-  assert.equal(aac.getTrainingEvidence().accepted,1);
+  assert.equal(aac.getTrainingEvidence().attempted,1);
   assert.equal(aac._regressions.polynomial.xSamples.length,1);
   aac.lockTraining(true);
   assert.equal(global.webgazer.recordScreenPosition(110,90,"click"),false);
@@ -79,7 +79,7 @@ test("Calibration gate rejects stale patches, freezes both models, and resets st
   aac.resetTraining();
   assert.equal(aac._regressions.polynomial.xSamples.length,0);
   assert.equal(aac._regressions.rbf.features.length,0);
-  assert.equal(aac.getTrainingEvidence().accepted,0);
+  assert.equal(aac.getTrainingEvidence().attempted,0);
   assert.equal(aac.getTrainingEvidence().locked,true);
  } finally {aac.lockTraining(false);global.webgazer=original;}
 });
