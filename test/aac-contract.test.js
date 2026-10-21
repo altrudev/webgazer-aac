@@ -86,3 +86,30 @@ test("Rejected calibration load returns null, not a seemingly restored snapshot"
  try {assert.equal(await aac.loadCalibration(),null);assert.equal(aac._kalman.Q,q);}
  finally {aac._store=old;}
 });
+
+test("Tracker interruption clears stale patches and rejects gaze output", () => {
+ const aac=global.webgazerAAC;
+ const prior=global.webgazer, oldInstalled=aac._installed, oldPatches=aac._lastPatches;
+ let listener=null, available=true, emitted=[];
+ global.webgazer={
+  setRegression(){return this;},
+  setGazeListener(cb){listener=cb;return this;},
+  recordScreenPosition(){return this;},
+  getTracker(){return available ? {getEyePatches(){return {left:{},right:{}};}} : null;}
+ };
+ try {
+  aac._installed=false;
+  aac.install();
+  aac._lastPatches={stale:true};
+  available=false;
+  global.webgazer.setGazeListener((value)=>emitted.push(value));
+  listener({x:100,y:100},0);
+  assert.equal(emitted.at(-1),null);
+  assert.equal(aac._lastPatches,null);
+  assert.equal(aac._lastResult,null);
+  assert.equal(aac._lastConfidence,0);
+  assert.equal(aac._kalman.x,null);
+ } finally {
+  global.webgazer=prior;aac._installed=oldInstalled;aac._lastPatches=oldPatches;
+ }
+});
