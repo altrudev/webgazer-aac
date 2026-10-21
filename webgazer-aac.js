@@ -961,10 +961,8 @@
         this._holdUntil = now + this.holdAfterMs;
         this._progress  = 0;
         this._fireEvent(element, 'webgazer-aac:dwell-complete', { x, y });
-        // Feed drift watchdog + adaptive recalibrator
-        if (this._aacRef) {
-          try { this._aacRef.recordDwellHitXY(x, y); } catch (e) {}
-        }
+        // A gaze-derived dwell is not independent confirmation of user intent.
+        // Applications may explicitly submit independently confirmed calibration separately.
       }
 
       return this._progress;
@@ -1687,23 +1685,28 @@
 
     recordDwellHit(element) {
       if (!this._recalibrator || !this._lastPatches) return;
-      this._recalibrator.recordElementHit(element, this._lastPatches);
-      // Drift watchdog uses dwell hits as ground-truth signal too
-      if (this._watchdog && element) {
-        try {
-          const r = element.getBoundingClientRect();
-          this._watchdog.record(this._lastPatches, r.left + r.width / 2, r.top + r.height / 2);
-        } catch (e) {}
-      }
+      // A dwell hit is model-derived and must not retrain or validate that model.
+      // Retained as a no-op for backwards API compatibility.
     },
 
     recordDwellHitXY(x, y) {
       if (!this._recalibrator || !this._lastPatches) return;
+      // Model-derived gaze coordinates are not independent target evidence.
+      // Retained as a no-op for backwards API compatibility.
+    },
+
+    /**
+     * Accept an independently confirmed screen position. Do not call from a
+     * dwell-complete handler or with coordinates inferred from the gaze model.
+     * @param {number} x Confirmed target x in viewport pixels.
+     * @param {number} y Confirmed target y in viewport pixels.
+     */
+    recordConfirmedPosition(x, y) {
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+      if (!this._recalibrator || !this._lastPatches) return false;
       this._recalibrator.recordHit(x, y, this._lastPatches);
-      // Drift watchdog
-      if (this._watchdog) {
-        try { this._watchdog.record(this._lastPatches, x, y); } catch (e) {}
-      }
+      if (this._watchdog) this._watchdog.record(this._lastPatches, x, y);
+      return true;
     },
 
     /**

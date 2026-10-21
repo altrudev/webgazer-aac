@@ -1,0 +1,9 @@
+{
+  "name": "webgazer-aac",
+  "version": "1.3.0",
+  "private": true,
+  "description": "Local-first gaze enhancement for AAC",
+  "scripts": {
+    "test": "node --test test/aac-contract.test.js"
+  }
+}
