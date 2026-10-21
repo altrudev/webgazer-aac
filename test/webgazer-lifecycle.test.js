@@ -47,3 +47,39 @@ test("WebGazer 3.x eyeFeatures are consumed without invoking async getEyePatches
   assert.equal(values.at(-1),null);assert.equal(calls,0);
  } finally{global.webgazer=original;}
 });
+
+test("Calibration gate rejects stale patches, freezes both models, and resets state",()=>{
+ const aac=global.webgazerAAC;
+ let callback, upstream=0;
+ const original=global.webgazer;
+ const w=8,h=8,rgba=new Uint8ClampedArray(w*h*4);
+ for(let i=0;i<rgba.length;i+=4){rgba[i]=80;rgba[i+1]=50;rgba[i+2]=30;rgba[i+3]=255;}
+ const patches={left:{patch:{width:w,height:h,data:rgba}},right:{patch:{width:w,height:h,data:rgba}}};
+ global.webgazer={
+  setRegression(){return this;},
+  setGazeListener(cb){callback=cb;return this;},
+  recordScreenPosition(){upstream++;return this;},
+  getTracker(){return {getCurrentEyePatches:()=>patches};}
+ };
+ try {
+  aac._installed=false;aac.install();
+  aac.resetTraining();aac.lockTraining(false);
+  assert.equal(global.webgazer.recordScreenPosition(100,80,"click"),false,"no eye frame yet");
+  assert.equal(upstream,0);
+  global.webgazer.setGazeListener(()=>{});
+  callback({x:100,y:80,eyeFeatures:patches},0);
+  assert.equal(global.webgazer.recordScreenPosition(100,80,"click"),undefined);
+  assert.equal(upstream,1);
+  assert.equal(aac.getTrainingEvidence().accepted,1);
+  assert.equal(aac._regressions.polynomial.xSamples.length,1);
+  aac.lockTraining(true);
+  assert.equal(global.webgazer.recordScreenPosition(110,90,"click"),false);
+  assert.equal(upstream,1);
+  assert.equal(aac._regressions.polynomial.xSamples.length,1);
+  aac.resetTraining();
+  assert.equal(aac._regressions.polynomial.xSamples.length,0);
+  assert.equal(aac._regressions.rbf.features.length,0);
+  assert.equal(aac.getTrainingEvidence().accepted,0);
+  assert.equal(aac.getTrainingEvidence().locked,true);
+ } finally {aac.lockTraining(false);global.webgazer=original;}
+});
