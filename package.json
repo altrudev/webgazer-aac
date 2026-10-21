@@ -4,6 +4,6 @@
   "private": true,
   "description": "Local-first gaze enhancement for AAC",
   "scripts": {
-    "test": "node --test test/aac-contract.test.js test/webgazer-lifecycle.test.js test/eye-patch-normalization.test.js"
+    "test": "node --test test/aac-contract.test.js test/webgazer-lifecycle.test.js test/eye-patch-normalization.test.js test/eye-geometry.test.js"
   }
 }
