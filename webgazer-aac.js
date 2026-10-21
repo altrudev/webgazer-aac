@@ -893,12 +893,14 @@
     this.dwellMs       = options.dwellMs       || 800;
     this.minConfidence = options.minConfidence || 0.25;
     this.holdAfterMs   = options.holdAfterMs   || 1200;
+    this.maxPauseMs    = options.maxPauseMs === undefined ? 1500 : Math.max(0, options.maxPauseMs);
     this._aacRef       = options.aacRef        || null;
 
     this._target     = null;   // current DOM element being dwelled on
     this._progress   = 0;      // 0–1
     this._lastT      = null;
     this._holdUntil  = 0;      // timestamp: freeze re-fire after completion
+    this._pausedSince = null;
   }
 
   DwellTimer.prototype = {
@@ -918,8 +920,14 @@
     update(element, x, y, confidence, isSaccade, isBlink) {
       const now = performance.now();
 
-      // Null gaze (blink) — freeze progress, don't reset
-      if (element === null || isBlink) {
+      // Invalid or missing signals cannot make progress; prolonged interruption
+      // invalidates a partial dwell instead of resuming stale intent.
+      const invalid = element === null || isBlink || !Number.isFinite(x) ||
+        !Number.isFinite(y) || !Number.isFinite(confidence) ||
+        confidence < 0 || confidence > 1;
+      if (invalid) {
+        if (this._pausedSince === null) this._pausedSince = now;
+        if (now - this._pausedSince >= this.maxPauseMs) this.reset();
         this._lastT = now;
         return this._progress;
       }
@@ -936,13 +944,22 @@
         return 0;
       }
 
-      const dt = this._lastT !== null ? Math.min(now - this._lastT, 100) : 0;
+      const dt = this._lastT !== null ? Math.max(0, Math.min(now - this._lastT, 100)) : 0;
       this._lastT = now;
 
-      // Freeze conditions — progress holds, does not advance or reset
+      // Freeze conditions — progress holds briefly, then resets on stale input.
       const frozen = isSaccade ||
                      confidence < this.minConfidence ||
                      now < this._holdUntil;
+      if (frozen) {
+        if (this._pausedSince === null) this._pausedSince = now;
+        if (now - this._pausedSince >= this.maxPauseMs) {
+          this.reset();
+          return 0;
+        }
+      } else {
+        this._pausedSince = null;
+      }
 
       if (!frozen) {
         this._progress = Math.min(1, this._progress + dt / this.dwellMs);
@@ -974,6 +991,7 @@
       this._progress  = 0;
       this._lastT     = null;
       this._holdUntil = 0;
+      this._pausedSince = null;
     },
 
     /** Current progress 0–1. */

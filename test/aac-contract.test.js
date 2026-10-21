@@ -43,3 +43,29 @@ test("Legacy model-derived dwell API never retrains and confirmed positions requ
   assert.equal(trained,1);assert.equal(watched,1);
  } finally {aac._recalibrator=oldR;aac._watchdog=oldW;aac._lastPatches=oldP;}
 });
+
+test("Malformed gaze and backwards clock cannot activate dwell", () => {
+ const t=new webgazerAAC.DwellTimer({dwellMs:100,maxPauseMs:1000});
+ let fired=0;const target={dispatchEvent(e){if(e.type==="webgazer-aac:dwell-complete") fired++;return true;}};
+ const original=performance.now;let clock=1000;performance.now=()=>clock;
+ try {
+  t.update(target,1,1,0.9,false,false);clock=900;t.update(target,1,1,0.9,false,false);
+  assert.equal(t.progress,0);
+  clock=950;t.update(target,NaN,1,0.9,false,false);
+  clock=1000;t.update(target,1,1,NaN,false,false);
+  assert.equal(t.progress,0);assert.equal(fired,0);
+ }finally{performance.now=original;}
+});
+test("Extended gaze interruption discards partial dwell", () => {
+ const t=new webgazerAAC.DwellTimer({dwellMs:500,maxPauseMs:150});
+ const target={dispatchEvent(){return true;}};
+ const original=performance.now;let clock=1000;performance.now=()=>clock;
+ try {
+  t.update(target,1,1,0.9,false,false);clock+=80;t.update(target,1,1,0.9,false,false);
+  assert.ok(t.progress>0);
+  clock+=10;t.update(null,1,1,0.9,false,true);
+  clock+=160;t.update(null,1,1,0.9,false,true);
+  assert.equal(t.progress,0);
+  t.update(target,1,1,0.9,false,false);assert.equal(t.progress,0);
+ }finally{performance.now=original;}
+});
