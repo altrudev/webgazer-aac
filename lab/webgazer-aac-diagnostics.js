@@ -1,0 +1,27 @@
+(()=>{
+'use strict';
+const E=id=>document.getElementById(id), t0=performance.now();
+let events=[],running=false,runStart=null,activeMs=0,valid=0,invalid=0,lossRuns=0,recoveries=[],lossStart=null,stops=0,checks=[],lastGaze=null,videoFrames=0,lastPhase='',cameraVideo=null,frameCallbackId=0;
+const stamp=()=>Math.round(performance.now()-t0);
+function log(type,code=''){let previous=events.at(-1);if(previous&&previous.type===type&&previous.code===code&&stamp()-previous.elapsed_ms<250)return;events.push({elapsed_ms:stamp(),type,code:String(code).replace(/[^a-zA-Z0-9_ ./-]/g,'').slice(0,75)});if(events.length>120)events.shift();render();}
+function render(){E('diag-events').textContent=events.slice(-12).map(x=>(x.elapsed_ms/1000).toFixed(1)+'s '+x.type+' '+x.code).join('\n')||'No events';E('metric-valid').textContent=valid;E('metric-invalid').textContent=invalid;E('metric-recovery').textContent=recoveries.length?Math.round(recoveries.reduce((a,b)=>a+b,0)/recoveries.length)+' ms':'—';E('metric-accuracy').textContent=checks.length?Math.round(checks.reduce((a,b)=>a+b.error,0)/checks.length)+' px / '+checks.length+' targets':'—';E('metric-camera').textContent=videoFrames?videoFrames+' observed video frames':'Not observable';}
+function watchVideo(){if(!running)return;let v=Array.from(document.querySelectorAll('video')).find(v=>v.srcObject);if(v&&v!==cameraVideo){cameraVideo=v;if(typeof v.requestVideoFrameCallback==='function'){const next=()=>{if(!running)return;videoFrames++;v.requestVideoFrameCallback(next)};v.requestVideoFrameCallback(next)}else log('camera_frame_api_unavailable');}}
+const watch=setInterval(watchVideo,600);
+function sample(d){if(!running)return; if(!d||!Number.isFinite(d.x)||!Number.isFinite(d.y)){invalid++;if(lossStart===null){lossStart=performance.now();lossRuns++;log('tracking_lost')} }else{valid++;lastGaze={x:d.x,y:d.y,time:performance.now()};if(lossStart!==null){const ms=performance.now()-lossStart;recoveries.push(ms);if(recoveries.length>100)recoveries.shift();lossStart=null;log('tracking_recovered',Math.round(ms)+'ms')}}render();}
+function begin(){if(running)return;running=true;runStart=performance.now();lastGaze=null;lossStart=null;cameraVideo=null;log('session_started');}
+function stop(){if(!running)return;running=false;activeMs+=performance.now()-runStart;runStart=null;lossStart=null;lastGaze=null;stops++;log('camera_stopped');}
+function target(x,y){if(!running)return;const g=lastGaze;if(!g||performance.now()-g.time>600){log('accuracy_skipped','no_recent_gaze');return}const error=Math.hypot(x-g.x,y-g.y);checks.push({error:Math.round(error)});log('target_check',Math.round(error)+'px');render();}
+const status=E('status'),phase=E('phase');
+new MutationObserver(()=>{const x=phase.textContent||'';if(x!==lastPhase){lastPhase=x;log('phase',x)}if(x==='running')begin()}).observe(phase,{subtree:true,childList:true,characterData:true});
+new MutationObserver(()=>{const s=status.textContent||'';if(s.startsWith('Camera error')){stop();log('exception',(/\b(TypeError|ReferenceError|NotAllowedError|NotFoundError|SecurityError)\b/.exec(E('errorinfo').textContent||'')||[])[0]||'startup_failure')}if(s.startsWith('Camera stopped'))stop()}).observe(status,{childList:true,subtree:true});
+const oldGazeListener=window.webgazer&&window.webgazer.setGazeListener;
+if(oldGazeListener){window.webgazer.setGazeListener=function(cb){return oldGazeListener.call(this,function(d,time){sample(d);return cb(d,time)})};}
+E('stop').addEventListener('click',stop,true);
+E('stage').querySelectorAll('.target').forEach(el=>el.addEventListener('click',()=>{const r=el.getBoundingClientRect();target(r.left+r.width/2,r.top+r.height/2)},true));
+function report(){const err=E('errorinfo')?.textContent||'';const match=/\b(TypeError|ReferenceError|RangeError|NotAllowedError|NotFoundError|SecurityError|AbortError)\b/.exec(err);return {schema:'altru-aac-diagnostics/2',consent:'user-export-only',webgazer:'3.5.3',aac:'1.3.0',upstream_only:E('baseline').checked,secure_context:isSecureContext,camera_api:!!navigator.mediaDevices?.getUserMedia,active_session_ms:Math.round(activeMs+(running?performance.now()-runStart:0)),valid_gaze_callbacks:valid,invalid_gaze_callbacks:invalid,tracking_loss_episodes:lossRuns,mean_recovery_ms:recoveries.length?Math.round(recoveries.reduce((a,b)=>a+b,0)/recoveries.length):null,observed_camera_frames:videoFrames||null,camera_frame_measurement:videoFrames?'requestVideoFrameCallback':'unavailable',target_checks:checks.length,mean_target_error_px:checks.length?Math.round(checks.reduce((a,b)=>a+b.error,0)/checks.length):null,stops,error_type:match?.[0]||null,last_stage:lastPhase,events:[...events]};}
+const data=()=>JSON.stringify({...report(),validation:window.aacValidationReport?.()||null,guided_calibration:window.aacGuidedCalibration?.()||null,adapter_build:'2cae935654bcb2399622f27f44bc998c3377e87f'},null,2);
+E('diag-copy').onclick=async()=>{try{await navigator.clipboard.writeText(data());E('diag-export-status').textContent='Copied locally. Paste the report into ChatGPT.'}catch(e){E('diag-export-status').textContent='Copy unavailable. Save JSON instead.'}};
+E('diag-save').onclick=()=>{const u=URL.createObjectURL(new Blob([data()],{type:'application/json'})),a=document.createElement('a');a.href=u;a.download='altru-aac-diagnostics-v2.json';a.click();setTimeout(()=>URL.revokeObjectURL(u),1000);E('diag-export-status').textContent='Saved locally; nothing uploaded.'};
+window.addEventListener('pagehide',()=>{stop();clearInterval(watch)});
+log('page_ready');render();
+})();
