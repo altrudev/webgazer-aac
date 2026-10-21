@@ -1376,18 +1376,26 @@
       const _origSetGazeListener = webgazer.setGazeListener.bind(webgazer);
       webgazer.setGazeListener = function (callback) {
         return _origSetGazeListener(function (data, elapsedTime) {
-          // Cache latest eye patches
+          // Never reuse eye patches or predicted positions after tracker loss.
+          let patches = null;
           try {
             const tracker = webgazer.getTracker();
             if (tracker) {
-              self._lastPatches =
+              patches =
                 (tracker.getEyePatches && tracker.getEyePatches()) ||
                 (tracker.getCurrentEyePatches && tracker.getCurrentEyePatches()) ||
                 (webgazer.getCurrentEyePatches && webgazer.getCurrentEyePatches()) || null;
             }
-          } catch (e) {}
-
-          if (data === null) { callback(null, elapsedTime); return; }
+          } catch (e) { patches = null; }
+          self._lastPatches = patches;
+          if (data === null || !patches || !Number.isFinite(data.x) || !Number.isFinite(data.y)) {
+            self._cache = new FrameCache();
+            self._kalman.reset();
+            self._lastResult = null;
+            self._lastConfidence = 0;
+            callback(null, elapsedTime);
+            return;
+          }
 
           // Blink detection
           const isBlink = self._blink.update(self._lastPatches);
@@ -1607,6 +1615,21 @@
      */
     applyCalibrationSnapshot(snapshot) {
       if (!snapshot || snapshot.aacVersion !== '1.3.0') return false;
+      // Do not silently reuse viewport-specific calibration after a resize.
+      const width = typeof window !== 'undefined' ? window.innerWidth : 0;
+      const height = typeof window !== 'undefined' ? window.innerHeight : 0;
+      if (!Number.isFinite(snapshot.screenWidth) || !Number.isFinite(snapshot.screenHeight) ||
+          snapshot.screenWidth !== width || snapshot.screenHeight !== height) return false;
+      if (snapshot.kalman && (typeof snapshot.kalman !== 'object' ||
+          (snapshot.kalman.Q != null && (!Number.isFinite(snapshot.kalman.Q) || snapshot.kalman.Q <= 0)) ||
+          (snapshot.kalman.R != null && (!Number.isFinite(snapshot.kalman.R) || snapshot.kalman.R <= 0)))) return false;
+      if (snapshot.pca) {
+        for (const eye of ['left', 'right']) {
+          const p = snapshot.pca[eye];
+          if (p && p.fitted && (!Array.isArray(p.mean) || !p.mean.every(Number.isFinite) ||
+              !Array.isArray(p.basis) || !p.basis.every(row => Array.isArray(row) && row.every(Number.isFinite)))) return false;
+        }
+      }
 
       // Kalman params
       if (snapshot.kalman) {
@@ -1675,7 +1698,7 @@
       if (!this._store) this._store = new CalibrationStore();
       return this._store.load().then(snap => {
         if (!snap) return null;
-        this.applyCalibrationSnapshot(snap);
+        if (!this.applyCalibrationSnapshot(snap)) return null;
         return snap;
       }).catch(e => {
         console.warn('[webgazer-aac] loadCalibration failed:', e);
