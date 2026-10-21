@@ -1376,17 +1376,19 @@
       const _origSetGazeListener = webgazer.setGazeListener.bind(webgazer);
       webgazer.setGazeListener = function (callback) {
         return _origSetGazeListener(function (data, elapsedTime) {
-          // Never reuse eye patches or predicted positions after tracker loss.
-          let patches = null;
-          try {
-            const tracker = webgazer.getTracker();
-            if (tracker) {
+          // WebGazer 3.x includes already-resolved eyeFeatures on each prediction.
+          // Never call its asynchronous tracker.getEyePatches() without arguments.
+          let patches = data && data.eyeFeatures ? data.eyeFeatures : null;
+          if (!patches) {
+            try {
+              const tracker = webgazer.getTracker && webgazer.getTracker();
               patches =
-                (tracker.getEyePatches && tracker.getEyePatches()) ||
-                (tracker.getCurrentEyePatches && tracker.getCurrentEyePatches()) ||
+                (tracker && tracker.getCurrentEyePatches && tracker.getCurrentEyePatches()) ||
                 (webgazer.getCurrentEyePatches && webgazer.getCurrentEyePatches()) || null;
-            }
-          } catch (e) { patches = null; }
+            } catch (e) { patches = null; }
+          }
+          if (patches && typeof patches.then === 'function') patches = null;
+          if (!patches || !patches.left || !patches.right) patches = null;
           self._lastPatches = patches;
           if (data === null || !patches || !Number.isFinite(data.x) || !Number.isFinite(data.y)) {
             self._cache = new FrameCache();
