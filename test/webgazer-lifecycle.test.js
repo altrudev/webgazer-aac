@@ -28,3 +28,22 @@ test("WebGazer adapter suppresses interruption, rejects corrupt data, and recove
   callback(null,6);assert.equal(output.at(-1),null);
  } finally {global.webgazer=original;}
 });
+
+test("WebGazer 3.x eyeFeatures are consumed without invoking async getEyePatches",()=>{
+ const aac=global.webgazerAAC;
+ let callback, calls=0;const original=global.webgazer;
+ global.webgazer={
+  setRegression(){return this;},
+  setGazeListener(cb){callback=cb;return this;},
+  recordScreenPosition(){return this;},
+  getTracker(){return {getEyePatches(){calls++;return Promise.resolve({left:{},right:{}});}};}
+ };
+ try{
+  aac._installed=false;aac.install();
+  const values=[];global.webgazer.setGazeListener(v=>values.push(v));
+  callback({x:120,y:90,eyeFeatures:{left:{},right:{}}},1);
+  assert.equal(calls,0);assert.ok(values.at(-1));
+  callback({x:120,y:90},2);
+  assert.equal(values.at(-1),null);assert.equal(calls,0);
+ } finally{global.webgazer=original;}
+});
