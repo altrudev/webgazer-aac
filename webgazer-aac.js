@@ -331,11 +331,43 @@
     } catch (e) { return null; }
   }
 
+  // Normalize variable-size FaceMesh crops into stable 60x40 feature vectors.
+  // Without this step, PCA truncates large patches and zero-pads small ones.
+  function normalizeEyePatch(patch) {
+    const source = patch && (patch.patch || patch);
+    const width = source && source.width, height = source && source.height;
+    const pixels = source && source.data;
+    if (!Number.isInteger(width) || !Number.isInteger(height) ||
+        width < 3 || height < 3 || width > 2048 || height > 2048 ||
+        !pixels || pixels.length !== width * height * 4) return null;
+    const output = new Float32Array(PATCH_DIM);
+    for (let y = 0; y < 40; y++) {
+      const sy = (y + 0.5) * height / 40 - 0.5;
+      const y0 = Math.max(0, Math.floor(sy)), y1 = Math.min(height - 1, y0 + 1);
+      const fy = Math.max(0, Math.min(1, sy - y0));
+      for (let x = 0; x < 60; x++) {
+        const sx = (x + 0.5) * width / 60 - 0.5;
+        const x0 = Math.max(0, Math.floor(sx)), x1 = Math.min(width - 1, x0 + 1);
+        const fx = Math.max(0, Math.min(1, sx - x0));
+        const grey = (ix, iy) => {
+          const i = (iy * width + ix) * 4;
+          return .299 * pixels[i] + .587 * pixels[i + 1] + .114 * pixels[i + 2];
+        };
+        output[y * 60 + x] =
+          grey(x0, y0) * (1 - fx) * (1 - fy) +
+          grey(x1, y0) * fx * (1 - fy) +
+          grey(x0, y1) * (1 - fx) * fy +
+          grey(x1, y1) * fx * fy;
+      }
+    }
+    return { grey: clahe(output, 60, 40), width: 60, height: 40 };
+  }
+
   function extractFeatures(eyePatches, collectForPCA) {
     if (!eyePatches || !eyePatches.left || !eyePatches.right) return null;
 
-    const lResult = getGreyscale(eyePatches.left.patch || eyePatches.left);
-    const rResult = getGreyscale(eyePatches.right.patch || eyePatches.right);
+    const lResult = normalizeEyePatch(eyePatches.left);
+    const rResult = normalizeEyePatch(eyePatches.right);
     if (!lResult || !rResult) return null;
 
     // Optionally stash raw (pre-CLAHE) patches for later PCA fitting
