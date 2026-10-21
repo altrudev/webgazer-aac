@@ -1383,6 +1383,9 @@
     _lastPatches:    null,
     _lastConfidence: 0,
     _lastResult:     null,
+    _trainingLocked: false,
+    _lastPatchAt: 0,
+    _trainingAttempts: 0,
 
     install() {
       if (this._installed) return this;
@@ -1422,6 +1425,7 @@
           if (patches && typeof patches.then === 'function') patches = null;
           if (!patches || !patches.left || !patches.right) patches = null;
           self._lastPatches = patches;
+          self._lastPatchAt = patches ? performance.now() : 0;
           if (data === null || !patches || !Number.isFinite(data.x) || !Number.isFinite(data.y)) {
             self._cache = new FrameCache();
             self._kalman.reset();
@@ -1475,8 +1479,11 @@
       // Intercept recordScreenPosition to feed our model
       const _origRecord = webgazer.recordScreenPosition.bind(webgazer);
       webgazer.recordScreenPosition = function (x, y, eventType) {
+        if (self._trainingLocked) return false;
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !self._lastPatches || performance.now()-self._lastPatchAt>180) return false;
         _origRecord(x, y, eventType);
         if (self._regression && self._lastPatches) {
+          self._trainingAttempts++;
           try {
             self._regression.addData(self._lastPatches, x, y);
             // Track ensemble error
@@ -1494,6 +1501,27 @@
       this._installed    = true;
       console.info('[webgazer-aac] v1.3.0 installed — regression: ' + this._currentMode);
       return this;
+    },
+
+    /** Clear both independent AAC regressions, feature bases, and temporal prediction state. */
+    resetTraining() {
+      if (!this._regressions) return false;
+      const p = this._regressions.polynomial, r = this._regressions.rbf;
+      if (p) { p.xSamples=[];p.ySamples=[];p.weights=[];p.betaX=null;p.betaY=null;p._dirty=false; }
+      if (r) { r.features=[];r.targets=[];r.weights=[];r.alphaX=null;r.alphaY=null;r._dirty=false; }
+      const ens=this._regressions.ensemble;
+      if (ens) { ens._errPoly=0;ens._errRbf=0; }
+      for (const basis of [LEFT_PCA,RIGHT_PCA]) { basis.fitted=false;basis.mean=null; }
+      this.resetCalibrationPatches();
+      this._lastPatches=null;this._lastPatchAt=0;this._lastResult=null;
+      this._trainingAttempts=0;this._cache=new FrameCache();this._kalman.reset();
+      if (this._watchdog) this._watchdog.reset();
+      return true;
+    },
+    lockTraining(locked=true) {this._trainingLocked=!!locked;return this;},
+    getTrainingEvidence() {
+      return {locked:this._trainingLocked,attempted:this._trainingAttempts,
+        patchAgeMs:this._lastPatchAt?performance.now()-this._lastPatchAt:null};
     },
 
     /**
