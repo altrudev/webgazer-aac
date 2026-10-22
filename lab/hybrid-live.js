@@ -23,6 +23,7 @@ $('start').addEventListener('click',async()=>{$('start').disabled=true;text('sta
 try{const files=await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm');
 landmarker=await FaceLandmarker.createFromOptions(files,{baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',delegate:'CPU'},runningMode:'VIDEO',numFaces:1});
 if(typeof window.webgazer==='undefined')throw Error('WebGazer unavailable');
+window.webgazer.params.faceMeshSolutionPath='https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619';
 window.webgazer.setRegression('ridge').setTracker('TFFaceMesh').saveDataAcrossSessions(false).setGazeListener(d=>{latestGaze=d&&Number.isFinite(d.x)&&Number.isFinite(d.y)?{x:d.x,y:d.y,at:performance.now()}:null;text('gaze',latestGaze?Math.round(d.x)+', '+Math.round(d.y):'—')});
 await window.webgazer.begin();window.webgazer.removeMouseEventListeners?.();window.webgazer.showVideoPreview(false).showPredictionPoints(false);
 sourceVideo=document.getElementById('webgazerVideoFeed')||document.querySelector('#webgazerVideoContainer video');
