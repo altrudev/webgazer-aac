@@ -25,3 +25,5 @@ function createHybridObservationStream({measureIris, maxAgeMs=250, now=()=>perfo
  };
 }
 if(typeof module!=='undefined')module.exports={createHybridObservationStream};
+
+if(typeof window!=='undefined')window.AACHybridObservations={createHybridObservationStream};
