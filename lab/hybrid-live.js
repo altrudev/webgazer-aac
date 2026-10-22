@@ -11,8 +11,12 @@ function loop(t){if(!active)return;raf=requestAnimationFrame(loop);if(!landmarke
 try{const results=landmarker.detectForVideo(video,t),p=results.faceLandmarks[0];if(!p){rejected++;text('iris','No face');return;}
 const m=window.AACIrisGeometry.measureIris(p,video.videoWidth,video.videoHeight);
 bridge.observeLandmarks(p,t);const freshGaze=latestGaze&&t-latestGaze.at<=250&&t>=latestGaze.at?latestGaze:null;
-const report=bridge.comparePrediction(freshGaze);
-if(report.iris&&report.webgazer)paired++;else rejected++;
+const head=window.AACHeadEvidence.measureHead(p);
+const pair=window.AACHeadEvidence.frameEvidence({landmarkAt:t,gazeAt:freshGaze?.at,now:performance.now()});
+const report=bridge.comparePrediction(pair.paired?freshGaze:null);
+text('head',head.available?head.noseOffsetEyeWidths.toFixed(3)+' eye widths / roll '+(head.rollProxyRad*180/Math.PI).toFixed(1)+'° proxy':'—');
+text('timing',pair.paired?'≤'+Math.ceil(pair.maxAgeMs)+'ms / skew '+Math.ceil(pair.skewMs)+'ms':pair.reason);
+if(pair.paired&&report.iris&&report.webgazer)paired++;else rejected++;
 text('iris',m.available?'Both eyes measured':m.reason);text('left',m.available?m.left.horizontal.toFixed(3):'—');text('right',m.available?m.right.horizontal.toFixed(3):'—');text('paired',paired);text('rejected',rejected);draw(p,m);
 }catch(err){rejected++;text('status','Landmark inference error: '+String(err).slice(0,100));}}
 $('start').addEventListener('click',async()=>{$('start').disabled=true;text('status','Loading camera and landmark model');
